@@ -1,0 +1,41 @@
+{
+  "name": "king-of-diamonds-ai-game",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:client": "vite --host 127.0.0.1 --port 13444",
+    "dev:server": "node --env-file-if-exists=.env --import tsx src/server/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "preview": "node --env-file-if-exists=.env --import tsx src/server/index.ts",
+    "live:deepseek": "tsx scripts/live-deepseek-smoke.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@google/genai": "^1.29.1",
+    "@vitejs/plugin-react": "^5.1.1",
+    "cors": "^2.8.5",
+    "express": "^5.2.1",
+    "openai": "^6.10.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "concurrently": "^9.2.1",
+    "jsdom": "^27.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0",
+    "vitest": "^4.0.16"
+  }
+}
