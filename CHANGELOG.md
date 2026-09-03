@@ -1,5 +1,10 @@
 # Changelog
 
+## OnePoker-v0.1.6 - 2026-09-03
+
+- Added provider model discovery in AI settings, with connectivity checks and a selectable model list.
+- Added support for listing models from OpenAI-compatible, Anthropic, and Gemini endpoints, including endpoint normalization for OpenAI-compatible chat URLs.
+
 ## OnePoker-v0.1.5 - 2026-09-03
 
 - Added a timed, prominent banner for Kazuya's check, call, raise, and all-in actions while avoiding duplicate fold announcements.

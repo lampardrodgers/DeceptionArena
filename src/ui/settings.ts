@@ -63,6 +63,7 @@ const clampNum = (v: string, lo: number, hi: number, dflt: number) => {
 export interface SettingsPanelHooks {
   onSave(settings: AppSettings): void;
   test(config: ProviderConfig): Promise<string>;
+  listModels(config: ProviderConfig): Promise<string[]>;
 }
 
 /** AI 供应商设置面板。 */
@@ -72,10 +73,13 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
   const url = $<HTMLInputElement>("cfg-url");
   const key = $<HTMLInputElement>("cfg-key");
   const model = $<HTMLInputElement>("cfg-model");
+  const modelList = $<HTMLSelectElement>("cfg-model-list");
   const temp = $<HTMLInputElement>("cfg-temp");
   const timeout = $<HTMLInputElement>("cfg-timeout");
   const notes = $("cfg-notes");
   const testResult = $("cfg-test-result");
+  const btnModels = $<HTMLButtonElement>("cfg-models");
+  const btnTest = $<HTMLButtonElement>("cfg-test");
 
   for (const preset of PROVIDER_PRESETS) {
     const opt = document.createElement("option");
@@ -86,6 +90,31 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
 
   /** 记住每个预设在本次会话中的 URL / 模型 / 密钥，切换回来时不丢失。 */
   const perPreset = new Map<string, { baseUrl: string; model: string; apiKey: string }>();
+  /** 每个预设最近一次拉到的模型列表，切换回来时不用重新请求。 */
+  const modelsByPreset = new Map<string, string[]>();
+
+  const setStatus = (text: string, cls: "" | "ok" | "bad") => {
+    testResult.textContent = text;
+    testResult.className = cls;
+  };
+
+  /** 用给定的模型列表刷新下拉框；空列表表示尚未获取。 */
+  const fillModelList = (models: string[]) => {
+    modelList.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = models.length ? `— 共 ${models.length} 个模型，选择即填入上方 —` : "— 尚未获取 —";
+    modelList.appendChild(placeholder);
+    for (const id of models) {
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = id;
+      modelList.appendChild(opt);
+    }
+    modelList.disabled = models.length === 0;
+    // 当前填写的模型如果在列表里，就让下拉框跟着高亮它。
+    modelList.value = models.includes(model.value.trim()) ? model.value.trim() : "";
+  };
 
   const applyPreset = (id: string, keepValues: boolean) => {
     const preset = PROVIDER_PRESETS.find((p) => p.id === id) ?? PROVIDER_PRESETS[0];
@@ -102,6 +131,8 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
       key.value = saved?.apiKey ?? "";
     }
     notes.textContent = preset.notes;
+    modelList.disabled = !isApi;
+    fillModelList(modelsByPreset.get(preset.id) ?? []);
   };
 
   const fill = (settings: AppSettings) => {
@@ -117,8 +148,8 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
       model: settings.provider.model,
       apiKey: settings.provider.apiKey
     });
-    testResult.textContent = "";
-    testResult.className = "";
+    fillModelList(modelsByPreset.get(settings.provider.presetId) ?? []);
+    setStatus("", "");
   };
 
   const read = (): ProviderConfig => {
@@ -140,6 +171,16 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
       perPreset.set(provider.value, { baseUrl: url.value, model: model.value, apiKey: key.value });
     });
   }
+  model.addEventListener("input", () => {
+    const options = [...modelList.options].map((o) => o.value);
+    modelList.value = options.includes(model.value.trim()) ? model.value.trim() : "";
+  });
+  modelList.addEventListener("change", () => {
+    if (!modelList.value) return;
+    model.value = modelList.value;
+    perPreset.set(provider.value, { baseUrl: url.value, model: model.value, apiKey: key.value });
+    setStatus(`已选择模型 ${modelList.value}。`, "ok");
+  });
 
   $("cfg-cancel").addEventListener("click", () => modal.classList.add("hidden"));
   $("cfg-save").addEventListener("click", () => {
@@ -148,22 +189,51 @@ export function initSettingsPanel(initial: AppSettings, hooks: SettingsPanelHook
     hooks.onSave(settings);
     modal.classList.add("hidden");
   });
-  $("cfg-test").addEventListener("click", async () => {
+  btnModels.addEventListener("click", async () => {
     const config = read();
     if (config.kind === "heuristic") {
-      testResult.textContent = "内置机器人无需联网。";
-      testResult.className = "ok";
+      setStatus("内置机器人无需联网，也没有模型可选。", "ok");
       return;
     }
-    testResult.textContent = "测试中…";
-    testResult.className = "";
+    btnModels.disabled = true;
+    setStatus("正在连接并获取模型列表…", "");
+    try {
+      const models = await hooks.listModels(config);
+      modelsByPreset.set(config.presetId, models);
+      fillModelList(models);
+      if (!models.length) {
+        setStatus("连接成功，但该接口没有返回任何模型，请手动填写模型名。", "bad");
+        return;
+      }
+      // 模型名还空着时，直接替用户选上第一个，省一步操作。
+      if (!model.value.trim()) {
+        model.value = models[0];
+        modelList.value = models[0];
+        perPreset.set(provider.value, { baseUrl: url.value, model: model.value, apiKey: key.value });
+      }
+      setStatus(`连接成功 — 共 ${models.length} 个模型，请在上方下拉框中选择。`, "ok");
+    } catch (err) {
+      fillModelList([]);
+      setStatus(`获取失败：${err instanceof Error ? err.message : String(err)}`, "bad");
+    } finally {
+      btnModels.disabled = false;
+    }
+  });
+  btnTest.addEventListener("click", async () => {
+    const config = read();
+    if (config.kind === "heuristic") {
+      setStatus("内置机器人无需联网。", "ok");
+      return;
+    }
+    btnTest.disabled = true;
+    setStatus("测试中…", "");
     try {
       const say = await hooks.test(config);
-      testResult.textContent = `连接成功 — ${say}`;
-      testResult.className = "ok";
+      setStatus(`对话成功 — ${say}`, "ok");
     } catch (err) {
-      testResult.textContent = `失败：${err instanceof Error ? err.message : String(err)}`;
-      testResult.className = "bad";
+      setStatus(`失败：${err instanceof Error ? err.message : String(err)}`, "bad");
+    } finally {
+      btnTest.disabled = false;
     }
   });
 

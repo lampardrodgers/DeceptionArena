@@ -116,6 +116,11 @@
           <label>模型
             <input id="cfg-model" type="text" placeholder="deepseek-chat" />
           </label>
+          <label>可用模型（先点下方「检测连通并列出模型」）
+            <select id="cfg-model-list" disabled>
+              <option value="">— 尚未获取 —</option>
+            </select>
+          </label>
           <div class="grid2">
             <label>温度 <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="0.7" /></label>
             <label>超时（秒） <input id="cfg-timeout" type="number" min="5" max="600" step="5" value="90" /></label>
@@ -123,9 +128,10 @@
           <p class="notes" id="cfg-notes"></p>
           <p class="notes">密钥只保存在本浏览器的 localStorage，并直接发送给对应供应商。AI 每次决策都会收到完整的规则说明和当前局面（点击顶栏「AI 提示词」查看）。</p>
           <div class="row">
-            <button id="cfg-test" class="action">测试连接</button>
-            <span id="cfg-test-result"></span>
+            <button id="cfg-models" class="action">检测连通并列出模型</button>
+            <button id="cfg-test" class="action">试跑一次对话</button>
           </div>
+          <div class="row"><span id="cfg-test-result"></span></div>
           <div class="row end">
             <button id="cfg-cancel" class="action">取消</button>
             <button id="cfg-save" class="action primary">保存</button>

@@ -111,8 +111,89 @@ export async function callProvider(config: ProviderConfig, req: ChatRequest): Pr
   }
 }
 
+/**
+ * 拉取供应商的可用模型列表。同时充当连通性检测：
+ * 能列出模型，就说明 URL、密钥、CORS 都是通的。
+ */
+export async function listModels(config: ProviderConfig): Promise<string[]> {
+  if (config.kind === "heuristic") throw new Error("内置机器人没有 API。");
+  if (!config.apiKey && config.kind !== "openai-compatible") {
+    throw new Error("API 密钥为空。");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+  try {
+    let models: string[];
+    switch (config.kind) {
+      case "openai-compatible":
+        models = await listOpenAICompatibleModels(config, controller.signal);
+        break;
+      case "anthropic":
+        models = await listAnthropicModels(config, controller.signal);
+        break;
+      case "gemini":
+        models = await listGeminiModels(config, controller.signal);
+        break;
+      default:
+        throw new Error(`不支持的供应商类型 ${config.kind}`);
+    }
+    return [...new Set(models.filter(Boolean))].sort();
+  } catch (err) {
+    if ((err as Error).name === "AbortError") {
+      throw new Error(`请求超时（${config.timeoutMs} 毫秒）。`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function listOpenAICompatibleModels(config: ProviderConfig, signal: AbortSignal): Promise<string[]> {
+  const headers: Record<string, string> = {};
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+  const res = await fetch(`${openAiRoot(config.baseUrl)}/models`, { method: "GET", headers, signal });
+  const data = await readJson(res);
+  const list: any[] = data.data ?? data.models ?? [];
+  return list.map((m) => String(m?.id ?? m?.name ?? m ?? ""));
+}
+
+async function listAnthropicModels(config: ProviderConfig, signal: AbortSignal): Promise<string[]> {
+  const base = trimSlash(config.baseUrl).replace(/\/v1\/messages$/, "");
+  const res = await fetch(`${base}/v1/models?limit=1000`, {
+    method: "GET",
+    signal,
+    headers: {
+      "x-api-key": config.apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    }
+  });
+  const data = await readJson(res);
+  const list: any[] = data.data ?? [];
+  return list.map((m) => String(m?.id ?? ""));
+}
+
+async function listGeminiModels(config: ProviderConfig, signal: AbortSignal): Promise<string[]> {
+  const base = trimSlash(config.baseUrl);
+  const res = await fetch(`${base}/v1beta/models?pageSize=1000`, {
+    method: "GET",
+    signal,
+    headers: { "x-goog-api-key": config.apiKey }
+  });
+  const data = await readJson(res);
+  const list: any[] = data.models ?? [];
+  return list
+    .filter((m) => !m?.supportedGenerationMethods || m.supportedGenerationMethods.includes("generateContent"))
+    .map((m) => String(m?.name ?? "").replace(/^models\//, ""));
+}
+
 function trimSlash(url: string): string {
   return url.replace(/\/+$/, "");
+}
+
+/** OpenAI 兼容接口的根路径：用户可能直接填了 .../chat/completions。 */
+function openAiRoot(baseUrl: string): string {
+  return trimSlash(baseUrl).replace(/\/chat\/completions$/, "");
 }
 
 async function readJson(res: Response): Promise<any> {
@@ -128,8 +209,7 @@ async function readJson(res: Response): Promise<any> {
 }
 
 async function callOpenAICompatible(config: ProviderConfig, req: ChatRequest, signal: AbortSignal): Promise<string> {
-  const base = trimSlash(config.baseUrl);
-  const url = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
+  const url = `${openAiRoot(config.baseUrl)}/chat/completions`;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
   const res = await fetch(url, {
