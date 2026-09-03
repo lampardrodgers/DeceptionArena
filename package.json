@@ -1,6 +1,6 @@
 {
   "name": "pokesolo",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Kaiji One Poker (賭博黙示録カイジ 和也編 ワンポーカー) — three.js web game, human vs LLM Kazuya",
