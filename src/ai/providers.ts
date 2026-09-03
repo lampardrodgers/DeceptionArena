@@ -18,7 +18,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     baseUrl: "",
     defaultModel: "",
     editableUrl: false,
-    notes: "离线概率模型驱动的和也，不需要密钥。"
+    notes: "本地算法驱动的和也：记牌、读牌、按对局历史建模开司的习惯并计算期望值，不需要密钥。"
   },
   {
     id: "deepseek",

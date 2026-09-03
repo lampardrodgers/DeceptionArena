@@ -1,12 +1,6 @@
-import { type Card, cardLabel, category, compareCards, createDeck, isUp, RANK_LABEL } from "../game/cards.js";
-import {
-  type BetInput,
-  type GameState,
-  type Side,
-  legalBets,
-  lightsOf,
-  revealedCards
-} from "../game/engine.js";
+import { type Card, cardLabel, category, RANK_LABEL } from "../game/cards.js";
+import { type BetInput, type GameState, type Side, legalBets, lightsOf } from "../game/engine.js";
+import { botBet, botSelect, estimateWin, publicView, RANKS, unknownPool } from "./bot.js";
 import { callProvider, extractJson, PROVIDER_PRESETS, type ChatUsage, type ProviderConfig } from "./providers.js";
 
 export type DecisionKind = "select" | "bet";
@@ -19,6 +13,8 @@ export interface AiDecision {
   source: "llm" | "heuristic";
   error?: string;
   raw?: string;
+  /** 内置机器人的推理过程（人类可读）。 */
+  reasoning?: string;
 }
 
 export type AiTraceStatus = "thinking" | "ok" | "fallback" | "heuristic";
@@ -76,106 +72,22 @@ export function providerDisplayName(config: ProviderConfig): { label: string; sh
 const AI: Side = "ai";
 const HUMAN: Side = "player";
 
-// ---------- probability model ----------
+// ---------- 内置算法机器人 ----------
+// 概率模型、对手建模和期望值计算都在 ./bot.ts；这里只做适配。
 
-/** Cards not known to the AI: everything except its own cards and publicly revealed cards. */
-function unknownCards(state: GameState): Card[] {
-  const known = new Set<string>();
-  const me = state.players[AI];
-  for (const c of me.hand) known.add(c.id);
-  if (me.chosen) known.add(me.chosen.id);
-  for (const c of revealedCards(state)) known.add(c.id);
-  return createDeck().filter((c) => !known.has(c.id));
-}
-
-/**
- * Probability that `mine` beats the opponent's played card, given the opponent's lights.
- * Model: the opponent plays an UP card with probability up/(up+down) and, within a category,
- * every unknown card of that category is equally likely.
- */
+/** 我方某张牌对上开司本局打出的牌的胜率估计（记牌 + 读牌 + 本局下注证据）。 */
 export function winProbability(state: GameState, mine: Card): { win: number; lose: number; draw: number } {
-  const opp = state.players[HUMAN];
-  const lights = opp.chosen ? lightsIncludingChosen(opp) : lightsOf(opp);
-  const pool = unknownCards(state);
-  const ups = pool.filter(isUp);
-  const downs = pool.filter((c) => !isUp(c));
-  const total = lights.up + lights.down || 1;
-  const pUp = lights.up / total;
-  const pDown = lights.down / total;
-  const stat = (cards: Card[]) => {
-    if (!cards.length) return { win: 0, lose: 0, draw: 0 };
-    let w = 0;
-    let l = 0;
-    let d = 0;
-    for (const c of cards) {
-      const r = compareCards(mine, c);
-      if (r > 0) w += 1;
-      else if (r < 0) l += 1;
-      else d += 1;
-    }
-    return { win: w / cards.length, lose: l / cards.length, draw: d / cards.length };
-  };
-  const u = stat(ups);
-  const dn = stat(downs);
-  return {
-    win: pUp * u.win + pDown * dn.win,
-    lose: pUp * u.lose + pDown * dn.lose,
-    draw: pUp * u.draw + pDown * dn.draw
-  };
+  return estimateWin(publicView(state), mine);
 }
-
-function lightsIncludingChosen(p: GameState["players"][Side]) {
-  const cards = p.chosen ? [p.chosen, ...p.hand] : p.hand;
-  let up = 0;
-  let down = 0;
-  for (const c of cards) (isUp(c) ? (up += 1) : (down += 1));
-  return { up, down };
-}
-
-// ---------- heuristic Kazuya ----------
 
 export function heuristicSelect(state: GameState, rng = Math.random): AiDecision {
-  const hand = state.players[AI].hand;
-  const scored = hand.map((c) => ({ c, p: winProbability(state, c) }));
-  scored.sort((a, b) => b.p.win - a.p.win || a.c.rank - b.c.rank);
-  // Mostly pick the best card; occasionally keep the strong card for later.
-  const pick = scored.length > 1 && rng() < 0.15 && scored[1].p.win > 0.35 ? scored[1] : scored[0];
-  return {
-    kind: "select",
-    cardId: pick.c.id,
-    say: pick.p.win > 0.7 ? "クク……置いたぞ。" : "さあ、始めようか。",
-    source: "heuristic"
-  };
+  const d = botSelect(publicView(state), rng);
+  return { kind: "select", cardId: d.cardId, say: d.say, source: "heuristic", reasoning: d.reasoning };
 }
 
 export function heuristicBet(state: GameState, rng = Math.random): AiDecision {
-  const me = state.players[AI];
-  const legal = legalBets(state, AI);
-  const p = winProbability(state, me.chosen!).win;
-  const bluff = rng() < 0.12;
-  let bet: BetInput;
-  let say = "";
-  if (legal.canRaise && (p > 0.72 || (bluff && p > 0.3))) {
-    const span = legal.maxRaiseTo - legal.minRaiseTo;
-    const strength = Math.max(0, Math.min(1, (p - 0.6) / 0.4));
-    const raiseTo = p > 0.95 ? legal.maxRaiseTo : legal.minRaiseTo + Math.round(span * strength * rng());
-    bet = { type: "raise", raiseTo };
-    say = raiseTo === legal.maxRaiseTo ? "全部だ……オールイン！" : `レイズ。${raiseTo} 命だ。`;
-  } else if (legal.canCall) {
-    const pot = legal.callAmount;
-    const needed = pot / (pot + me.stake + state.players[HUMAN].stake);
-    if (p >= needed + 0.05 || (p >= 0.4 && legal.callAmount <= 1)) {
-      bet = { type: "call" };
-      say = "コール。見せてもらおうか、お前の牌を。";
-    } else {
-      bet = { type: "fold" };
-      say = "……つまらん。降りる。";
-    }
-  } else {
-    bet = { type: "check" };
-    say = "チェック。";
-  }
-  return { kind: "bet", bet, say, source: "heuristic" };
+  const d = botBet(publicView(state), rng);
+  return { kind: "bet", bet: d.bet, say: d.say, source: "heuristic", reasoning: d.reasoning };
 }
 
 // ---------- LLM Kazuya ----------
@@ -198,6 +110,12 @@ export const RULES = [
 /** 完整系统提示词 = 人设 + 规则。每次请求完全相同，供应商的前缀缓存靠它命中。 */
 export const FULL_SYSTEM_PROMPT = `${SYSTEM_PROMPT}\n\n【One Poker 规则】\n${RULES}`;
 
+function lightsIncludingChosen(p: GameState["players"][Side]) {
+  const l = lightsOf(p);
+  if (p.chosen) (p.chosen.rank >= 8 ? (l.up += 1) : (l.down += 1));
+  return l;
+}
+
 function describeHistory(state: GameState): unknown[] {
   return state.history.map((r) => ({
     round: r.round,
@@ -214,11 +132,9 @@ function describeHistory(state: GameState): unknown[] {
 }
 
 function remainingRankCounts(state: GameState): Record<string, number> {
+  const pool = unknownPool(publicView(state));
   const counts: Record<string, number> = {};
-  for (const c of unknownCards(state)) {
-    const label = RANK_LABEL[c.rank];
-    counts[label] = (counts[label] ?? 0) + 1;
-  }
+  for (const r of RANKS) counts[RANK_LABEL[r]] = pool[r];
   return counts;
 }
 
@@ -316,6 +232,7 @@ export async function decide(
     const fb = fallback();
     trace.status = "heuristic";
     trace.endedAt = Date.now();
+    trace.reasoning = fb.reasoning ?? "";
     trace.summary = describeDecision(state, fb);
     notify();
     return fb;
@@ -397,6 +314,7 @@ export async function decide(
     trace.status = "fallback";
     trace.error = message;
     trace.endedAt = Date.now();
+    if (fb.reasoning) trace.reasoning = [trace.reasoning.trim(), `—— 内置机器人接手 ——\n${fb.reasoning}`].filter(Boolean).join("\n\n");
     trace.summary = `（回退内置机器人）${describeDecision(state, fb)}`;
     notify();
     return { ...fb, error: message, raw: trace.output };

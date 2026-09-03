@@ -216,7 +216,8 @@ function updateTraceView(t: AiTrace): void {
   v.secReasoning.classList.toggle("hidden", !t.reasoning && !streaming);
   v.secOutput.classList.toggle("hidden", !t.output && !streaming && t.status !== "heuristic");
   if (t.status === "heuristic") {
-    v.secReasoning.classList.add("hidden");
+    // 内置机器人没有模型原文，但有自己的推理过程。
+    v.secReasoning.classList.toggle("hidden", !t.reasoning);
     v.secOutput.classList.add("hidden");
   }
   const atBottom = (el: HTMLElement) => el.scrollHeight - el.scrollTop - el.clientHeight < 24;
@@ -272,7 +273,7 @@ function aiSummaryHtml(): { html: string; cls: string } {
   const p = settings.provider;
   const { label, model } = providerDisplayName(p);
   if (p.kind === "heuristic") {
-    return { html: `<b>${escapeHtml(label)}</b><small>离线概率模型，不需要 API。想让大模型来扮演和也，点右侧按钮选择。</small>`, cls: "" };
+    return { html: `<b>${escapeHtml(label)}</b><small>本地算法：记牌、读牌、对手行为建模与期望值计算，不需要 API。想让大模型来扮演和也，点右侧按钮选择。</small>`, cls: "" };
   }
   const head = `<b>${escapeHtml(label)}</b> · ${escapeHtml(model || "（未填模型）")}`;
   if (!p.apiKey && p.kind !== "openai-compatible") {

@@ -31,7 +31,7 @@ npm test         # 规则引擎测试
 
 | 预设 | 接口地址（可改） | 说明 |
 | --- | --- | --- |
-| 内置机器人 | – | 离线概率模型，无需密钥 |
+| 内置机器人 | – | 本地算法：记牌 + 读牌 + 对手建模 + 期望值计算，无需密钥 |
 | DeepSeek | `https://api.deepseek.com` | OpenAI 兼容格式 |
 | OpenAI | `https://api.openai.com/v1` | Chat Completions |
 | OpenAI 兼容格式 | 任意 `/chat/completions` 接口 | Ollama、vLLM、Kimi、GLM、Qwen、OpenRouter…… |

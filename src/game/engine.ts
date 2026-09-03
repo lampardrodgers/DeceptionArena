@@ -65,6 +65,8 @@ export interface GameState {
   discard: Card[];
   /** Cards removed by the cutting card. Never enter play; nobody knows them. */
   cut: Card[];
+  /** Rounds at whose deal the exhausted deck was rebuilt from the (public) discard pile. */
+  reshuffles: number[];
   decks: number;
   players: Record<Side, PlayerState>;
   round: number;
@@ -119,6 +121,7 @@ export function newGame(options: GameOptions = {}): GameState {
     deck: pile,
     discard: [],
     cut,
+    reshuffles: [],
     decks,
     players: {
       player: {
@@ -167,6 +170,7 @@ function drawCard(state: GameState, rng: Rng): Card {
     }
     state.deck = shuffle(state.discard, rng);
     state.discard = [];
+    state.reshuffles.push(state.round);
     log(state, "牌堆已用尽，弃牌堆重新洗牌后继续。");
   }
   return state.deck.pop()!;

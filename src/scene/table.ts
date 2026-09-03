@@ -78,7 +78,7 @@ export class TableScene {
     this.scene.background = new THREE.Color("#050408");
     this.scene.fog = new THREE.FogExp2("#050408", 0.045);
 
-    this.backMat = new THREE.MeshStandardMaterial({ map: cardBackTexture(), roughness: 0.55 });
+    this.backMat = new THREE.MeshStandardMaterial({ map: cardBackTexture(), roughness: 0.55, alphaTest: 0.5 });
     this.edgeMat = new THREE.MeshStandardMaterial({ color: "#e9e4d8", roughness: 0.8 });
     this.figureMats = {
       player: {
@@ -348,11 +348,12 @@ export class TableScene {
   private makeCard(card: Card): CardNode {
     const group = new THREE.Group();
     group.userData.cardId = card.id;
-    const body = new THREE.Mesh(new THREE.BoxGeometry(CARD_W, CARD_T, CARD_H), this.edgeMat);
+    const body = new THREE.Mesh(this.cardBodyGeometry(), this.edgeMat);
     body.castShadow = true;
     const front = new THREE.Mesh(
       new THREE.PlaneGeometry(CARD_W, CARD_H),
-      new THREE.MeshStandardMaterial({ map: cardFaceTexture(card), color: "#d9d9d9", roughness: 0.6 })
+      // 贴图四角透明（圆角），alphaTest 把角裁掉，露出下面同样是圆角的牌身。
+      new THREE.MeshStandardMaterial({ map: cardFaceTexture(card), color: "#d9d9d9", roughness: 0.6, alphaTest: 0.5 })
     );
     front.rotation.x = -Math.PI / 2;
     front.position.y = CARD_T / 2 + 0.001;
@@ -367,6 +368,30 @@ export class TableScene {
     const node: CardNode = { card, group, slot: "deck", faceUp: false, targetKey: "" };
     this.cards.set(card.id, node);
     return node;
+  }
+
+  private bodyGeo?: THREE.BufferGeometry;
+  /** 圆角矩形挤出的牌身，厚度 CARD_T，平躺在 XZ 平面（与原 BoxGeometry 同向）。 */
+  private cardBodyGeometry(): THREE.BufferGeometry {
+    if (this.bodyGeo) return this.bodyGeo;
+    const r = CARD_W * (22 / 256);
+    const w = CARD_W / 2;
+    const h = CARD_H / 2;
+    const shape = new THREE.Shape();
+    shape.moveTo(-w + r, -h);
+    shape.lineTo(w - r, -h);
+    shape.absarc(w - r, -h + r, r, -Math.PI / 2, 0, false);
+    shape.lineTo(w, h - r);
+    shape.absarc(w - r, h - r, r, 0, Math.PI / 2, false);
+    shape.lineTo(-w + r, h);
+    shape.absarc(-w + r, h - r, r, Math.PI / 2, Math.PI, false);
+    shape.lineTo(-w, -h + r);
+    shape.absarc(-w + r, -h + r, r, Math.PI, Math.PI * 1.5, false);
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: CARD_T, bevelEnabled: false, curveSegments: 8 });
+    geo.translate(0, 0, -CARD_T / 2);
+    geo.rotateX(Math.PI / 2);
+    this.bodyGeo = geo;
+    return geo;
   }
 
   private moveTo(node: CardNode, pos: THREE.Vector3, rot: THREE.Euler, duration: number, arc: number) {
