@@ -1,11 +1,12 @@
 # Changelog
 
-## main-v0.2.0 - 2026-09-03
+## main-v0.2.1 - 2026-09-03
 
 - Reorganized the repository into a repository-only `main` branch and standalone game branches.
 - Published the 方片K (King of Diamonds) game on `方片k`.
 - Added the One Poker game on `pokesolo`.
 - Added bilingual branch discovery and checkout instructions.
+- Kept `main` limited to repository-level documentation and removed an unrelated game reference document.
 
 ## v0.1.0 - 2026-06-23
 
