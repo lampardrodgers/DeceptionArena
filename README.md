@@ -1,6 +1,6 @@
-# 方片K (King of Diamonds)
+# King of Diamonds
 
-This branch contains the standalone browser-based AI strategy game **方片K (King of Diamonds)**. Players submit numbers, the target is calculated from the group average, and the closest player survives while others lose score. The app supports both human-vs-AI and pure-AI matches.
+This branch contains the standalone browser-based AI strategy game **King of Diamonds** (方片K). Players submit numbers, the target is calculated from the group average, and the closest player survives while others lose score. The app supports both human-vs-AI and pure-AI matches.
 
 Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
 

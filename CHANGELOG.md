@@ -1,8 +1,13 @@
 # Changelog
 
+## king-of-diamonds-v0.1.2 - 2026-09-03
+
+- Renamed the standalone game branch from `方片k` to `king-of-diamonds`, matching the game's English name.
+- Standardized the branch documentation and package version for the renamed release.
+
 ## v0.1.1 - 2026-09-03
 
-- Published 方片K (King of Diamonds) as the standalone `方片k` game branch.
+- Published King of Diamonds (方片K) as a standalone game branch.
 - Kept the bilingual game documentation and updated the package version for the branch release.
 
 ## v0.1.0 - 2026-06-23
