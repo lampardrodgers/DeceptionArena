@@ -1,32 +1,47 @@
-# DeceptionArena
+# One Poker（ワンポーカー）— 赌博堕天录 开司·和也篇
 
-DeceptionArena is a shared GitHub repository for standalone browser games. The `main` branch contains only this repository-level description; each concrete game lives in its own branch with its own source, dependencies, and README.
+基于 **three.js** 的网页版单挑扑克：你扮演开司，大语言模型扮演和也，规则按《赌博堕天录 开司》和也篇的 One Poker 原作实现。
 
-## Games
-
-| Game | Branch | Description |
-| --- | --- | --- |
-| 方片K (King of Diamonds) | `方片k` | A multiplayer AI number-strategy game based on the King of Diamonds format. |
-| One Poker — Kaiji Kazuya Arc | `pokesolo` | A three.js browser implementation of One Poker, human versus an AI Kazuya. |
-
-## Getting a game
-
-Clone the repository and switch to the game branch you want to run:
+## 运行
 
 ```bash
-git clone https://github.com/lampardrodgers/DeceptionArena.git
-cd DeceptionArena
-git switch 方片k       # or: git switch pokesolo
+npm install
+npm run dev      # http://127.0.0.1:13460
+npm run build    # 打包到 dist/
+npm test         # 规则引擎测试
 ```
 
-Each game branch has its own quick-start instructions and project structure in its `README.md`. The game code is intentionally not merged into `main`, so the two projects can evolve independently while sharing one repository.
+全部在浏览器内运行，没有后端。输入的 API 密钥只保存在本机 `localStorage`，请求由页面直接发给对应供应商。
 
-## Branches
+## 已实现的规则（按原作）
 
-- `main` — repository-level description and branch index.
-- `方片k` — standalone 方片K / King of Diamonds project.
-- `pokesolo` — standalone One Poker project.
+- **牌堆**：三副去掉鬼牌的扑克（156 张）洗成一摞，开局用切牌卡随机切掉上方 0～30% 不用。牌堆用尽时把弃牌洗回。
+- **手牌**：双方各持 2 张。**UP** = 8、9、10、J、Q、K、A；**DOWN** = 2～7。双方桌前的指示灯（红 = UP，蓝 = DOWN）公开各自手牌中两类的张数，但不显示具体是哪张。
+- **出牌**：每回合双方各盖出 1 张，然后下注，最后翻牌。点数大者胜，A 最大，唯一例外 **2 胜 A**。同点平局，赌注退回。花色无关。
+- **下注**：以「命」（人形筹码）为单位，每回合双方必须各押 1 命。先手可以过牌或加注，面对加注可以跟注、再加注或弃牌。加注上限为双方命数中较少的一方（全押）。弃牌把自己已押的命输给对方，之后双方的牌照样翻开。
+- **先手**：第一回合可在开局选择（随机 / 开司 / 和也），之后由上一回合的胜者先手，平局不变。
+- **补牌**：回合结束后打出的牌进入弃牌堆，双方各补 1 张，指示灯随之更新。
+- **胜负**：命数归零者破产。开局时可分别设置双方命数，默认 12 对 12（也提供原作 2 对 10 的快捷预设）。
 
-## License
+## AI 供应商
 
-No license has been declared yet.
+点击顶栏 **⚙ AI 设置** 选择和也的大脑：
+
+| 预设 | 接口地址（可改） | 说明 |
+| --- | --- | --- |
+| 内置机器人 | – | 离线概率模型，无需密钥 |
+| DeepSeek | `https://api.deepseek.com` | OpenAI 兼容格式 |
+| OpenAI | `https://api.openai.com/v1` | Chat Completions |
+| OpenAI 兼容格式 | 任意 `/chat/completions` 接口 | Ollama、vLLM、Kimi、GLM、Qwen、OpenRouter…… |
+| Anthropic Claude | `https://api.anthropic.com` | Messages API（附带浏览器直连请求头） |
+| Google Gemini | `https://generativelanguage.googleapis.com` | generateContent |
+
+每次轮到和也时，页面都会把完整的规则说明、它的手牌、双方指示灯、命数、本回合下注过程、历史开牌记录以及未知牌的点数统计一起发给模型，模型只需回复 JSON（选牌或下注 + 一句台词）。点击顶栏 **AI 提示词** 可查看实际发送的系统提示词和当前局面。若调用失败或返回非法动作，则由内置机器人代为决策，日志中会注明。自建接口需允许浏览器跨域（CORS）。
+
+## 目录结构
+
+- `src/game/` — 规则引擎（纯函数，vitest 测试）
+- `src/ai/` — 供应商适配、和也的决策提示词与启发式回退
+- `src/scene/` — three.js 牌桌、卡牌、人形筹码、指示灯面板、粒子特效、辉光后期
+- `src/ui/` — 开局设置与 AI 设置面板
+- `src/main.ts` — 对局流程与 HUD

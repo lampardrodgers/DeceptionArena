@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>One Poker · 赌博堕天录 开司 和也篇</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage"></div>
+      <div id="vignette"></div>
+      <div id="flash"></div>
+      <div id="hud">
+        <div id="topbar">
+          <div class="stat ai" id="stat-ai"><span class="name">和也</span><span class="lives">12</span><span class="tag">命</span></div>
+          <div id="round-info">第 — 回合</div>
+          <div class="stat player" id="stat-player"><span class="name">开司</span><span class="lives">12</span><span class="tag">命</span></div>
+          <div id="topbar-buttons">
+            <button id="btn-rules" class="ghost">规则</button>
+            <button id="btn-prompt" class="ghost">AI 提示词</button>
+            <button id="btn-settings" class="ghost">⚙ AI 设置</button>
+            <button id="btn-new" class="ghost">新对局</button>
+          </div>
+        </div>
+        <div id="bubble" class="hidden"><div class="who">和也</div><div class="text"></div></div>
+        <div id="banner" class="hidden"></div>
+        <div id="side-left">
+          <div id="status"></div>
+          <div id="actions" class="hidden">
+            <div class="stakes">赌注 <b id="stake-you">1</b> 命 对 <b id="stake-ai">1</b> 命 · 上限 <b id="stake-max">12</b></div>
+            <div class="row">
+              <button id="btn-check" class="action">过牌</button>
+              <button id="btn-call" class="action">跟注</button>
+              <button id="btn-fold" class="action danger">弃牌</button>
+            </div>
+            <div class="row raise">
+              <input id="raise-range" type="range" min="2" max="2" step="1" value="2" />
+              <span id="raise-value">2</span>
+              <button id="btn-raise" class="action primary">加注至</button>
+              <button id="btn-allin" class="action primary">全押</button>
+            </div>
+          </div>
+        </div>
+        <div id="next-wrap" class="hidden"><button id="btn-next" class="action primary">下一回合 ⏎</button></div>
+        <div id="log"></div>
+      </div>
+
+      <div id="overlay" class="hidden">
+        <div class="overlay-inner">
+          <div class="kicker"></div>
+          <div class="title"></div>
+          <div class="sub"></div>
+          <div class="cta"><button id="overlay-btn" class="action primary big">再来一局</button></div>
+        </div>
+      </div>
+
+      <div id="modal-setup" class="modal hidden">
+        <div class="modal-card setup">
+          <div class="brand">ONE POKER</div>
+          <h2>对局设置</h2>
+          <p class="notes">按原作规则：三副去鬼牌的扑克洗成一摞，切牌卡随机切掉 0～30%。每回合各押 1 命起，加注上限为双方命数中较少的一方。</p>
+          <div class="lives-grid">
+            <div class="lives-box player">
+              <div class="who">开司（你）</div>
+              <div class="stepper">
+                <button class="step" data-step="player:-1">−</button>
+                <input id="setup-player-lives" type="number" min="1" max="60" value="12" />
+                <button class="step" data-step="player:1">＋</button>
+              </div>
+              <div class="unit">命</div>
+            </div>
+            <div class="vs">VS</div>
+            <div class="lives-box ai">
+              <div class="who">和也（AI）</div>
+              <div class="stepper">
+                <button class="step" data-step="ai:-1">−</button>
+                <input id="setup-ai-lives" type="number" min="1" max="60" value="12" />
+                <button class="step" data-step="ai:1">＋</button>
+              </div>
+              <div class="unit">命</div>
+            </div>
+          </div>
+          <div class="row presets">
+            <span class="dim">快捷：</span>
+            <button class="chip" data-preset="12,12">12 对 12</button>
+            <button class="chip" data-preset="2,10">原作 2 对 10</button>
+            <button class="chip" data-preset="5,5">5 对 5</button>
+            <button class="chip" data-preset="20,20">20 对 20</button>
+          </div>
+          <label>第一回合先手
+            <select id="setup-first">
+              <option value="random">随机</option>
+              <option value="player">开司</option>
+              <option value="ai">和也</option>
+            </select>
+          </label>
+          <p class="notes">之后的回合由上一回合的胜者先手，平局则先手不变。</p>
+          <div class="row end"><button id="setup-start" class="action primary big">开始对局</button></div>
+        </div>
+      </div>
+
+      <div id="modal-settings" class="modal hidden">
+        <div class="modal-card">
+          <h2>和也 AI 设置</h2>
+          <label>供应商
+            <select id="cfg-provider"></select>
+          </label>
+          <label>接口地址（Base URL）
+            <input id="cfg-url" type="text" placeholder="https://api.deepseek.com" />
+          </label>
+          <label>API 密钥
+            <input id="cfg-key" type="password" placeholder="sk-..." autocomplete="off" />
+          </label>
+          <label>模型
+            <input id="cfg-model" type="text" placeholder="deepseek-chat" />
+          </label>
+          <div class="grid2">
+            <label>温度 <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="0.7" /></label>
+            <label>超时（秒） <input id="cfg-timeout" type="number" min="5" max="600" step="5" value="90" /></label>
+          </div>
+          <p class="notes" id="cfg-notes"></p>
+          <p class="notes">密钥只保存在本浏览器的 localStorage，并直接发送给对应供应商。AI 每次决策都会收到完整的规则说明和当前局面（点击顶栏「AI 提示词」查看）。</p>
+          <div class="row">
+            <button id="cfg-test" class="action">测试连接</button>
+            <span id="cfg-test-result"></span>
+          </div>
+          <div class="row end">
+            <button id="cfg-cancel" class="action">取消</button>
+            <button id="cfg-save" class="action primary">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="modal-prompt" class="modal hidden">
+        <div class="modal-card wide">
+          <h2>发给 AI 的提示词</h2>
+          <p class="notes">每次轮到和也时，都会把下面的系统提示词与当前局面（以本回合真实数据为例）一起发给所选模型；模型只需回复 JSON。</p>
+          <h3>系统提示词</h3>
+          <pre id="prompt-system"></pre>
+          <h3>用户消息（当前局面示例）</h3>
+          <pre id="prompt-user"></pre>
+          <div class="row end"><button id="prompt-close" class="action primary">关闭</button></div>
+        </div>
+      </div>
+
+      <div id="modal-rules" class="modal hidden">
+        <div class="modal-card">
+          <h2>One Poker（ワンポーカー）规则</h2>
+          <ol class="rules">
+            <li><b>牌堆</b>：三副去掉鬼牌的扑克（156 张）洗成一摞，开局用切牌卡随机切掉上方 0～30% 不用。牌堆用尽时把弃牌洗回。</li>
+            <li><b>手牌</b>：双方各持 2 张。<b class="up">UP</b> = 8、9、10、J、Q、K、A；<b class="down">DOWN</b> = 2～7。双方面前的指示灯公开各自手牌中 UP / DOWN 的张数（红灯 = UP，蓝灯 = DOWN），但不显示具体哪张。</li>
+            <li><b>出牌</b>：每回合双方各选 1 张盖着打出，然后下注，最后翻牌比大小。A 最大，唯一例外：<b>2 胜 A</b>。同点平局，赌注退回。花色无关。</li>
+            <li><b>下注</b>：以「命」为单位，每回合双方必须各押 1 命。先手可以过牌或加注；面对加注可以跟注、再加注或弃牌。加注上限为双方命数中较少的一方（全押）。弃牌把自己已押的命输给对方，之后双方的牌照样翻开。</li>
+            <li><b>先手</b>：第一回合先手可在开局设置；之后由上一回合的胜者先手，平局则不变。</li>
+            <li><b>补牌</b>：回合结束后打出的牌进入弃牌堆，双方各补 1 张，指示灯随之更新。</li>
+            <li><b>胜负</b>：命数归零者破产败北。默认 12 命对 12 命，可在开局自由设置。</li>
+          </ol>
+          <div class="row end"><button id="rules-close" class="action primary">关闭</button></div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
