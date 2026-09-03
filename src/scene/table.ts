@@ -357,7 +357,8 @@ export class TableScene {
     front.rotation.x = -Math.PI / 2;
     front.position.y = CARD_T / 2 + 0.001;
     const back = new THREE.Mesh(new THREE.PlaneGeometry(CARD_W, CARD_H), this.backMat);
-    back.rotation.x = Math.PI / 2;
+    // Rotate the back print 180° in-plane so a face-down card (group z = π) reads upright from the player's seat.
+    back.rotation.set(Math.PI / 2, 0, Math.PI);
     back.position.y = -CARD_T / 2 - 0.001;
     group.add(body, front, back);
     group.position.copy(DECK_POS);
@@ -447,7 +448,9 @@ export class TableScene {
       if (!card) return;
       const node = this.cards.get(card.id);
       if (!node) return;
-      this.moveTo(node, new THREE.Vector3(0, 0.02, PLAY_Z[side]), new THREE.Euler(0, 0, node.faceUp ? 0 : Math.PI), 560, 0.7);
+      // Kazuya's played card faces him (print upside-down to the player); yours faces you.
+      const yaw = side === "ai" ? Math.PI : 0;
+      this.moveTo(node, new THREE.Vector3(0, 0.02, PLAY_Z[side]), new THREE.Euler(0, yaw, node.faceUp ? 0 : Math.PI), 560, 0.7);
     };
     play(state.players.player.chosen, "player");
     play(state.players.ai.chosen, "ai");

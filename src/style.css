@@ -77,6 +77,8 @@ button { font: inherit; cursor: pointer; }
 }
 #banner.win .big { color: var(--gold-bright); text-shadow: 0 0 40px rgba(255,211,107,0.9), 0 0 80px rgba(255,211,107,0.5), 0 4px 0 rgba(0,0,0,0.6); }
 #banner.lose .big { color: var(--red); text-shadow: 0 0 40px rgba(255,40,60,0.9), 0 0 90px rgba(255,40,60,0.5), 0 4px 0 rgba(0,0,0,0.6); }
+#banner.action .big { font-size: clamp(44px, 7vw, 88px); color: var(--paper); text-shadow: 0 0 30px rgba(255,255,255,0.55), 0 0 60px rgba(212,162,76,0.35), 0 4px 0 rgba(0,0,0,0.6); }
+#banner.action .sub { border-color: rgba(212,162,76,0.5); color: var(--gold-bright); }
 #banner.draw .big { color: #c9c4ff; text-shadow: 0 0 30px rgba(180,180,255,0.7); }
 @keyframes banner-in { from { opacity: 0; transform: translate(-50%, -50%) scale(2.4); filter: blur(8px); } to { opacity: 1; transform: translate(-50%, -50%) scale(1); filter: blur(0); } }
 

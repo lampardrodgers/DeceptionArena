@@ -232,13 +232,35 @@ async function aiBet(): Promise<void> {
   try {
     const decision = await aiThink(() => decide(state, "bet", settings.provider));
     if (id !== gameId || state.round !== round || state.phase !== "betting" || state.toAct !== "ai") return;
-    act(state, "ai", decision.bet!);
+    const bet = decision.bet!;
+    const stakeBefore = state.players.ai.stake;
+    act(state, "ai", bet);
     speak(decision);
+    // 弃牌由结算横幅播报「和也弃牌」，这里不重复；其余动作先大字播报再继续流程。
+    if (bet.type !== "fold") {
+      await announceAiAction(bet, stakeBefore);
+      if (id !== gameId || state.round !== round) return;
+    }
   } finally {
     aiBusy = false;
   }
   render();
   void afterAction();
+}
+
+const ACTION_HOLD_MS = 1300;
+async function announceAiAction(bet: BetInput, stakeBefore: number): Promise<void> {
+  const A = state.players.ai;
+  let big = "";
+  if (bet.type === "check") big = "过牌";
+  else if (bet.type === "call") big = "跟注";
+  else if (bet.type === "raise") big = A.stake >= state.maxStake ? "全下" : "加注";
+  let sub = `和也 · 赌注 ${stakeBefore} → ${A.stake}`;
+  if (bet.type === "check") sub = `和也 · 赌注 ${A.stake}`;
+  else if (bet.type === "call") sub = `和也 · 跟到 ${A.stake}`;
+  showBanner(big, sub, "action");
+  await sleep(ACTION_HOLD_MS);
+  if (ui.banner.className === "action") hideBanner();
 }
 
 function playerBet(input: BetInput): void {
