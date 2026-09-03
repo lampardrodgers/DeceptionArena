@@ -1,6 +1,6 @@
-# DeceptionArena
+# 方片K (King of Diamonds)
 
-DeceptionArena is a browser-based AI strategy game inspired by the King of Diamonds number game. Players submit numbers, the target is calculated from the group average, and the closest player survives while others lose score. The app supports both human-vs-AI and pure-AI matches.
+This branch contains the standalone browser-based AI strategy game **方片K (King of Diamonds)**. Players submit numbers, the target is calculated from the group average, and the closest player survives while others lose score. The app supports both human-vs-AI and pure-AI matches.
 
 Chinese documentation: [README.zh-CN.md](./README.zh-CN.md)
 

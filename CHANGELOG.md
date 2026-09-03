@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.1 - 2026-09-03
+
+- Published 方片K (King of Diamonds) as the standalone `方片k` game branch.
+- Kept the bilingual game documentation and updated the package version for the branch release.
+
 ## v0.1.0 - 2026-06-23
 
 - Built the King of Diamonds browser game with React, Vite, and an Express server proxy.
