@@ -1,5 +1,10 @@
 # Changelog
 
+## OnePoker-v0.1.5 - 2026-09-03
+
+- Added a timed, prominent banner for Kazuya's check, call, raise, and all-in actions while avoiding duplicate fold announcements.
+- Preserved the action banner's cancellation behavior when a new game state supersedes the current round.
+
 ## OnePoker-v0.1.4 - 2026-09-03
 
 - Added a prominent timed banner for Kazuya's check, call, raise, and all-in actions without duplicating the existing fold announcement.

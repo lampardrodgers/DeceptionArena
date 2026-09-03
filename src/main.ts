@@ -1,4 +1,5 @@
 import { buildObservation, buildUserPrompt, decide, SYSTEM_PROMPT, testConnection, type AiDecision } from "./ai/brain.js";
+import { listModels } from "./ai/providers.js";
 import { cardLabel } from "./game/cards.js";
 import {
   act,
@@ -235,10 +236,13 @@ async function aiBet(): Promise<void> {
     const bet = decision.bet!;
     const stakeBefore = state.players.ai.stake;
     act(state, "ai", bet);
+    // 跟注/收尾过牌会立刻结算本回合，而结算会把双方押注清零，
+    // 所以播报要用动作记录里的 stakeAfter，不能读实时 stake。
+    const stakeAfter = state.actions[state.actions.length - 1]?.stakeAfter ?? stakeBefore;
     speak(decision);
     // 弃牌由结算横幅播报「和也弃牌」，这里不重复；其余动作先大字播报再继续流程。
     if (bet.type !== "fold") {
-      await announceAiAction(bet, stakeBefore);
+      await announceAiAction(bet, stakeBefore, stakeAfter);
       if (id !== gameId || state.round !== round) return;
     }
   } finally {
@@ -249,18 +253,17 @@ async function aiBet(): Promise<void> {
 }
 
 const ACTION_HOLD_MS = 1300;
-async function announceAiAction(bet: BetInput, stakeBefore: number): Promise<void> {
-  const A = state.players.ai;
+async function announceAiAction(bet: BetInput, stakeBefore: number, stakeAfter: number): Promise<void> {
   let big = "";
   if (bet.type === "check") big = "过牌";
   else if (bet.type === "call") big = "跟注";
-  else if (bet.type === "raise") big = A.stake >= state.maxStake ? "全下" : "加注";
-  let sub = `和也 · 赌注 ${stakeBefore} → ${A.stake}`;
-  if (bet.type === "check") sub = `和也 · 赌注 ${A.stake}`;
-  else if (bet.type === "call") sub = `和也 · 跟到 ${A.stake}`;
-  showBanner(big, sub, "action");
+  else if (bet.type === "raise") big = stakeAfter >= state.maxStake ? "全下" : "加注";
+  let sub = `和也 · 赌注 ${stakeBefore} → ${stakeAfter}`;
+  if (bet.type === "check") sub = `和也 · 赌注 ${stakeAfter}`;
+  else if (bet.type === "call") sub = `和也 · 跟到 ${stakeAfter}`;
+  showBanner(big, sub, "announce");
   await sleep(ACTION_HOLD_MS);
-  if (ui.banner.className === "action") hideBanner();
+  if (ui.banner.className === "announce") hideBanner();
 }
 
 function playerBet(input: BetInput): void {
@@ -363,7 +366,8 @@ const settingsPanel = initSettingsPanel(settings, {
       renderLog();
     }
   },
-  test: testConnection
+  test: testConnection,
+  listModels
 });
 $("btn-settings").addEventListener("click", () => settingsPanel.open());
 $("btn-rules").addEventListener("click", () => $("modal-rules").classList.remove("hidden"));
