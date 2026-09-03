@@ -56,7 +56,16 @@ export class TableScene {
   private slotMats: Record<Side, THREE.MeshBasicMaterial>;
   private shake = 0;
   private lastFrame = 0;
-  private cameraBase = new THREE.Vector3(0, 5.7, 6.1);
+  // 参考机位（宽屏）。窄屏 / 竖屏时按宽高比从这里往后拉并放大视角，保证桌面左右两侧不被裁掉。
+  private static readonly CAMERA_HOME = new THREE.Vector3(0, 5.7, 6.1);
+  // 竖屏机位：更俯视一些，桌面在画面里更接近正圆，纵向填得更满。
+  private static readonly CAMERA_HOME_PORTRAIT = new THREE.Vector3(0, 6.6, 5.0);
+  /** 0 = 宽屏机位，1 = 竖屏机位；竖屏时手牌放大、拉近，命数小人往外挪。 */
+  private portrait = 0;
+  /** 两侧的出牌位（描边框 + 圆环），竖屏时整组放大并撑开。 */
+  private playSlots = {} as Record<Side, THREE.Group>;
+  private static readonly FOG_DENSITY = 0.045;
+  private cameraBase = TableScene.CAMERA_HOME.clone();
   private cameraTarget = new THREE.Vector3(0, 0.15, -0.1);
   private flash = 0;
   private flashColor = new THREE.Color("#ffffff");
@@ -114,7 +123,10 @@ export class TableScene {
     this.composer.addPass(this.bloom);
     this.composer.addPass(new OutputPass());
 
+    // iOS Safari 上容器高度会在首帧之后随地址栏 / dvh 变化，且不一定触发 window resize，
+    // 画布若不跟着重设就会被 CSS 拉伸变形。这里用 ResizeObserver 监听容器本身，另在每帧兜底核对。
     window.addEventListener("resize", () => this.resize());
+    if (typeof ResizeObserver !== "undefined") new ResizeObserver(() => this.resize()).observe(container);
     this.renderer.domElement.addEventListener("pointermove", (e) => this.onPointerMove(e));
     this.renderer.domElement.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.resize();
@@ -193,18 +205,23 @@ export class TableScene {
     }
 
     // play slots
+    // 出牌位整组放在一个 Group 里：竖屏时连同打出的牌一起放大、往两侧撑开。
     for (const side of ["player", "ai"] as Side[]) {
+      const slot = new THREE.Group();
+      slot.position.set(0, 0, PLAY_Z[side]);
       const outline = new THREE.Mesh(new THREE.PlaneGeometry(CARD_W + 0.16, CARD_H + 0.16), this.slotMats[side]);
       outline.rotation.x = -Math.PI / 2;
-      outline.position.set(0, 0.003, PLAY_Z[side]);
-      this.scene.add(outline);
+      outline.position.set(0, 0.003, 0);
+      slot.add(outline);
       const inner = new THREE.Mesh(
         new THREE.RingGeometry(0.5, 0.52, 48),
         new THREE.MeshBasicMaterial({ color: "#d4a24c", transparent: true, opacity: 0.25, side: THREE.DoubleSide })
       );
       inner.rotation.x = -Math.PI / 2;
-      inner.position.set(0, 0.004, PLAY_Z[side]);
-      this.scene.add(inner);
+      inner.position.set(0, 0.004, 0);
+      slot.add(inner);
+      this.scene.add(slot);
+      this.playSlots[side] = slot;
     }
 
     // decorative deck / discard markers
@@ -257,19 +274,56 @@ export class TableScene {
 
   // ---------- frame loop ----------
 
+  private sizedW = 0;
+  private sizedH = 0;
+
   private resize() {
     const w = this.container.clientWidth;
     const h = this.container.clientHeight;
+    if (!w || !h || (w === this.sizedW && h === this.sizedH)) return;
+    this.sizedW = w;
+    this.sizedH = h;
     this.renderer.setSize(w, h, false);
     this.composer.setSize(w, h);
     this.bloom.resolution.set(w, h);
     this.camera.aspect = w / h;
+    this.frameCamera();
     this.camera.updateProjectionMatrix();
+    // 竖屏时开司的指示灯往桌心收一点，避免被左边框裁掉。
+    this.lamps.player.group.position.x = -2.75 + 0.5 * this.portrait;
+    this.layoutPlaySlots();
+    if (this.lastState) {
+      this.layoutHands();
+      this.layoutFigures(this.lastState);
+    }
+  }
+
+  /**
+   * 竖屏 / 窄屏取景：桌面是按 3:2 左右的画幅设计的，宽高比更窄时水平视野不够。
+   * 需要的水平覆盖倍数 need = 1.5 / aspect，一部分靠加大视角（最多 1.6 倍 tan），
+   * 其余靠把相机沿视线往后拉；雾的密度同步变稀，避免拉远后整桌发灰。
+   */
+  private frameCamera() {
+    const aspect = this.camera.aspect || 1;
+    // 超宽（手机横屏）时也略微后拉，给底部手牌和左下操作区留出余量。
+    // 竖屏只保证 ±3.5 左右（两块指示灯）进画面，牌堆 / 弃牌堆边缘可以出框，换牌面更大。
+    const need = Math.max(1, 1.2 / aspect, Math.min(1.25, aspect / 1.9));
+    const portrait = THREE.MathUtils.clamp((1.5 / aspect - 1) / 1.5, 0, 1);
+    this.portrait = portrait;
+    const fovScale = Math.min(1.6, Math.sqrt(need));
+    const dolly = need / fovScale;
+    this.camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(20)) * fovScale));
+    // 竖屏时底部有操作面板，把注视点往玩家侧挪一点，整桌在屏幕里就会往上抬，给底部操作区让位。
+    this.cameraTarget.z = -0.1 + portrait * 0.75;
+    const home = TableScene.CAMERA_HOME.clone().lerp(TableScene.CAMERA_HOME_PORTRAIT, portrait);
+    this.cameraBase.copy(home).sub(this.cameraTarget).multiplyScalar(dolly).add(this.cameraTarget);
+    (this.scene.fog as THREE.FogExp2).density = TableScene.FOG_DENSITY / dolly;
   }
 
   private frame(now: number) {
     const dt = Math.min(0.05, (now - this.lastFrame) / 1000 || 0.016);
     this.lastFrame = now;
+    if (this.container.clientWidth !== this.sizedW || this.container.clientHeight !== this.sizedH) this.resize();
     updateTweens(now);
     this.updateHover();
     this.burst.update(now);
@@ -440,22 +494,49 @@ export class TableScene {
     this.updateLamps(state);
   }
 
+  /** 竖屏时桌心出牌位与打出的牌的放大倍率。 */
+  private playScale(): number {
+    return 1 + 0.85 * this.portrait;
+  }
+
+  /** 出牌位在桌面上的实际 z：放大后往两侧撑开，整对再往和也那侧挪一点给底部手牌腾地方。 */
+  private playZ(side: Side): number {
+    return PLAY_Z[side] * this.playScale() - 0.3 * this.portrait;
+  }
+
+  /** 出牌位跟着 playScale 一起放大 / 分开，牌与描边框始终对齐。 */
+  private layoutPlaySlots() {
+    const s = this.playScale();
+    for (const side of ["player", "ai"] as Side[]) {
+      const slot = this.playSlots[side];
+      if (!slot) continue;
+      slot.scale.setScalar(s);
+      slot.position.z = this.playZ(side);
+    }
+  }
+
   private layoutHands() {
     const state = this.lastState;
     if (!state) return;
     // Player: cards held upright, leaning back toward the camera so they read like a real hand.
+    // 竖屏：手牌放大并拉近镜头，牌面更立一点正对着较高的机位。
+    const t = this.portrait;
     const ph = state.players.player.hand;
+    const hs = 1 + 0.55 * t;
     ph.forEach((c, i) => {
       const node = this.cards.get(c.id);
       if (!node || node.slot !== "playerHand") return;
       const n = ph.length;
-      const x = (i - (n - 1) / 2) * (CARD_W + 0.22);
+      const x = (i - (n - 1) / 2) * (CARD_W * hs + 0.22);
       const hover = this.hovered === c.id;
       const lift = hover ? 0.16 : 0;
+      node.group.scale.setScalar(hs);
+      // 出牌后只剩一张时，竖屏把它往桌心收一点，抬出底部下注面板的遮挡范围。
+      const z = 2.75 + (n === 1 ? 0.3 : 1.0) * t;
       this.moveTo(
         node,
-        new THREE.Vector3(x, 0.5 + lift, 2.75 - lift * 0.25),
-        new THREE.Euler(0.95, 0, 0),
+        new THREE.Vector3(x, 0.5 * hs + lift, z - lift * 0.25),
+        new THREE.Euler(0.95 - 0.3 * t, 0, 0),
         hover ? 130 : 480,
         0
       );
@@ -466,16 +547,27 @@ export class TableScene {
       const node = this.cards.get(c.id);
       if (!node || node.slot !== "aiHand") return;
       const n = ah.length;
-      const x = (i - (n - 1) / 2) * (CARD_W + 0.22);
-      this.moveTo(node, new THREE.Vector3(x, 0.45, -2.6), new THREE.Euler(0.95, 0, Math.PI), 480, 0);
+      const as = 1 + 0.25 * t;
+      const x = (i - (n - 1) / 2) * (CARD_W * as + 0.22);
+      node.group.scale.setScalar(as);
+      this.moveTo(node, new THREE.Vector3(x, 0.45 * as, -2.6), new THREE.Euler(0.95, 0, Math.PI), 480, 0);
     });
+    // 桌面中央打出的牌：竖屏时同样放大，并把两个出牌位往各自方向撑开，免得放大后叠在一起。
+    const ps = this.playScale();
     const play = (card: Card | null, side: Side) => {
       if (!card) return;
       const node = this.cards.get(card.id);
       if (!node) return;
       // Kazuya's played card faces him (print upside-down to the player); yours faces you.
       const yaw = side === "ai" ? Math.PI : 0;
-      this.moveTo(node, new THREE.Vector3(0, 0.02, PLAY_Z[side]), new THREE.Euler(0, yaw, node.faceUp ? 0 : Math.PI), 560, 0.7);
+      node.group.scale.setScalar(ps);
+      this.moveTo(
+        node,
+        new THREE.Vector3(0, 0.02 * ps, this.playZ(side)),
+        new THREE.Euler(0, yaw, node.faceUp ? 0 : Math.PI),
+        560,
+        0.7
+      );
     };
     play(state.players.player.chosen, "player");
     play(state.players.ai.chosen, "ai");
@@ -511,7 +603,9 @@ export class TableScene {
           const cols = Math.min(8, Math.max(4, Math.ceil(reserve / 3)));
           const col = i % cols;
           const row = Math.floor(i / cols);
-          target = new THREE.Vector3(dir * (1.25 + col * 0.31), 0, dir * (2.0 + row * 0.34));
+          // 竖屏手牌放大后会顶到玩家侧的小人，把小人往外挪一点。
+          const out = side === "player" ? 0.6 * this.portrait : 0;
+          target = new THREE.Vector3(dir * (1.25 + out + col * 0.31), 0, dir * (2.0 + row * 0.34));
         } else {
           // staked figures walk to the pot, beside the player's own slot
           const k = i - reserve;
@@ -551,7 +645,7 @@ export class TableScene {
 
   playerWins(big = false): void {
     this.burst.burst(
-      new THREE.Vector3(0, 0.4, PLAY_Z.player),
+      new THREE.Vector3(0, 0.4, this.playZ("player")),
       [new THREE.Color("#ffd700"), new THREE.Color("#ffffff"), new THREE.Color("#7fb6ff"), new THREE.Color("#fff2b0")],
       big ? 2.2 : 1.2,
       big ? 4.5 : 3
@@ -563,7 +657,7 @@ export class TableScene {
 
   playerLoses(big = false): void {
     this.burst.burst(
-      new THREE.Vector3(0, 0.4, PLAY_Z.ai),
+      new THREE.Vector3(0, 0.4, this.playZ("ai")),
       [new THREE.Color("#ff2a2a"), new THREE.Color("#ff7a00"), new THREE.Color("#5a0000")],
       big ? 2 : 1,
       big ? 3.5 : 2.4
