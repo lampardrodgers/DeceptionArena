@@ -6,8 +6,8 @@ DeceptionArena 是一个用于存放独立网页版游戏的 GitHub 仓库。`ma
 
 | 游戏 | 分支 | 说明 |
 | --- | --- | --- |
-| 方片K（King of Diamonds） | `方片k` | 基于“方片 K”规则的多人 AI 数字策略游戏。 |
-| One Poker — 开司·和也篇 | `pokesolo` | 基于 three.js 的 One Poker 网页版，真人对战 AI 和也。 |
+| King of Diamonds（方片K） | `king-of-diamonds` | 基于“方片 K”规则的多人 AI 数字策略游戏。 |
+| One Poker — 开司·和也篇 | `OnePoker` | 基于 three.js 的 One Poker 网页版，真人对战 AI 和也。 |
 
 ## 获取具体游戏
 
@@ -16,7 +16,7 @@ DeceptionArena 是一个用于存放独立网页版游戏的 GitHub 仓库。`ma
 ```bash
 git clone https://github.com/lampardrodgers/DeceptionArena.git
 cd DeceptionArena
-git switch 方片k       # 或：git switch pokesolo
+git switch king-of-diamonds       # 或：git switch OnePoker
 ```
 
 每个游戏分支的 `README.md` 都包含自己的启动方式和目录结构。游戏源码不会合并到 `main`，这样两个项目可以在同一个仓库中独立演进。
@@ -24,8 +24,8 @@ git switch 方片k       # 或：git switch pokesolo
 ## 分支说明
 
 - `main` — 仓库级别的项目说明和游戏分支索引。
-- `方片k` — 独立的方片K / King of Diamonds 项目。
-- `pokesolo` — 独立的 One Poker 项目。
+- `king-of-diamonds` — 独立的 King of Diamonds / 方片K 项目。
+- `OnePoker` — 独立的 One Poker 项目。
 
 ## 许可证
 

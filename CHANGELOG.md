@@ -1,5 +1,10 @@
 # Changelog
 
+## main-v0.2.3 - 2026-09-03
+
+- Renamed the standalone game branches to their English names: `king-of-diamonds` and `OnePoker`.
+- Updated the bilingual repository index and checkout instructions.
+
 ## main-v0.2.1 - 2026-09-03
 
 - Reorganized the repository into a repository-only `main` branch and standalone game branches.
