@@ -259,9 +259,10 @@ export function act(state: GameState, side: Side, input: BetInput): GameState {
   switch (input.type) {
     case "check": {
       if (!legal.canCheck) throw new Error("Cannot check while facing a raise.");
+      const closing = state.actions.length > 0; // 对方已经过牌或跟注，双方押注相同
       state.actions.push({ side, type: "check", stakeAfter: me.stake });
-      log(state, `${me.name} 过牌（当前押注 ${me.stake}）。`);
-      if (side !== state.firstMover) {
+      log(state, closing ? `${me.name} 过牌，不再加注（押注 ${me.stake}）。` : `${me.name} 过牌（当前押注 ${me.stake}）。`);
+      if (closing) {
         return finishBetting(state);
       }
       state.toAct = other(side);
@@ -271,8 +272,13 @@ export function act(state: GameState, side: Side, input: BetInput): GameState {
       if (!legal.canCall) throw new Error("Nothing to call.");
       me.stake = opp.stake;
       state.actions.push({ side, type: "call", stakeAfter: me.stake });
-      log(state, `${me.name} 跟注至 ${me.stake}。`);
-      return finishBetting(state);
+      if (me.stake >= state.maxStake) {
+        log(state, `${me.name} 跟注至 ${me.stake}，已达上限。`);
+        return finishBetting(state);
+      }
+      log(state, `${me.name} 跟注至 ${me.stake}。${opp.name} 可以过牌开牌或继续加注。`);
+      state.toAct = other(side);
+      return state;
     }
     case "raise": {
       if (!legal.canRaise) throw new Error("Cannot raise: stake is already at the maximum.");

@@ -1,5 +1,13 @@
 # Changelog
 
+## OnePoker-v0.1.7 - 2026-09-03
+
+- Added streaming AI responses with a live thinking panel showing the prompt, reasoning/output stream, final decision, usage, cache hits, retries, and fallback errors.
+- Added reasoning-effort controls for OpenAI-compatible, Anthropic, and Gemini providers, plus provider-specific finish-reason and token-usage handling.
+- Added saved AI profiles, setup-time opponent summaries, and persisted provider/model/credential settings.
+- Updated the betting flow so a call can be followed by a closing check or another raise, with matching prompt guidance and regression coverage.
+- Added the One Poker web icon and expanded AI decision tests.
+
 ## OnePoker-v0.1.6 - 2026-09-03
 
 - Added provider model discovery in AI settings, with connectivity checks and a selectable model list.

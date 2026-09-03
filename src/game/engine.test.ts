@@ -72,9 +72,43 @@ describe("round flow", () => {
     expect(legal.callAmount).toBe(2);
     expect(legal.canFold).toBe(true);
     act(s, "ai", { type: "call" });
+    // 跟注后不直接开牌：被跟注方还可以过牌开牌或继续加注
+    expect(s.phase).toBe("betting");
+    expect(s.toAct).toBe("player");
+    const again = legalBets(s, "player");
+    expect(again.canCheck).toBe(true);
+    expect(again.canRaise).toBe(true);
+    expect(again.canCall).toBe(false);
+    act(s, "player", { type: "check" });
     expect(s.lastResult?.result).toBe("player"); // 2 beats A
     expect(s.lastResult?.livesMoved).toBe(3);
     expect(s.players.player.lives).toBe(8);
+  });
+
+  it("lets the called side re-raise, and the round keeps going until a closing check", () => {
+    const s = setup(["2S", "3H"], ["AD", "5C"]);
+    selectCard(s, "player", "2S");
+    selectCard(s, "ai", "AD");
+    act(s, "player", { type: "raise", raiseTo: 2 });
+    act(s, "ai", { type: "call" });
+    act(s, "player", { type: "raise", raiseTo: 4 });
+    expect(s.toAct).toBe("ai");
+    expect(legalBets(s, "ai").callAmount).toBe(2);
+    act(s, "ai", { type: "call" });
+    expect(s.toAct).toBe("player");
+    act(s, "player", { type: "check" });
+    expect(s.lastResult?.livesMoved).toBe(4);
+    expect(s.players.player.lives).toBe(9);
+  });
+
+  it("goes straight to showdown when a call reaches the stake cap", () => {
+    const s = setup(["2S", "3H"], ["AD", "5C"]);
+    selectCard(s, "player", "2S");
+    selectCard(s, "ai", "AD");
+    act(s, "player", { type: "raise", raiseTo: s.maxStake });
+    act(s, "ai", { type: "call" });
+    expect(s.phase).not.toBe("betting");
+    expect(s.lastResult?.livesMoved).toBe(5);
   });
 
   it("fold forfeits the folder's own stake only", () => {

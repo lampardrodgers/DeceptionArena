@@ -1,4 +1,13 @@
-import { buildObservation, buildUserPrompt, decide, SYSTEM_PROMPT, testConnection, type AiDecision } from "./ai/brain.js";
+import {
+  buildObservation,
+  buildUserPrompt,
+  decide,
+  FULL_SYSTEM_PROMPT,
+  providerDisplayName,
+  testConnection,
+  type AiDecision,
+  type AiTrace
+} from "./ai/brain.js";
 import { listModels } from "./ai/providers.js";
 import { cardLabel } from "./game/cards.js";
 import {
@@ -54,14 +63,230 @@ const ui = {
   overlay: $("overlay"),
   overlayKicker: $("overlay").querySelector<HTMLElement>(".kicker")!,
   overlayTitle: $("overlay").querySelector<HTMLElement>(".title")!,
-  overlaySub: $("overlay").querySelector<HTMLElement>(".sub")!
+  overlaySub: $("overlay").querySelector<HTMLElement>(".sub")!,
+  chip: $<HTMLButtonElement>("ai-chip"),
+  chipWho: $("ai-chip-who"),
+  chipState: $("ai-chip-state"),
+  thinkPanel: $("think-panel"),
+  thinkBody: $("tp-body"),
+  thinkProvider: $("tp-provider")
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function providerLabel(): string {
+function providerLabel(short = false): string {
+  const name = providerDisplayName(settings.provider);
+  const label = short ? name.short : name.label;
+  return name.model ? `${label} · ${name.model}` : label;
+}
+
+// ---------- AI 状态指示 & 思考面板 ----------
+
+const MAX_TRACES = 40;
+const traces: AiTrace[] = [];
+/** 每条记录对应的 DOM 引用，流式更新时只改文本，不重建，避免用户展开的状态被重置。 */
+const traceViews = new Map<number, { root: HTMLDetailsElement; st: HTMLElement; reasoning: HTMLElement; output: HTMLElement; result: HTMLElement; meta: HTMLElement; secReasoning: HTMLElement; secOutput: HTMLElement; secErr: HTMLElement; err: HTMLElement; rn: HTMLElement; on: HTMLElement }>();
+let chipTimer: ReturnType<typeof setInterval> | undefined;
+let currentTrace: AiTrace | undefined;
+
+const fmtSec = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+function renderChip(): void {
+  const t = currentTrace;
+  const heuristic = settings.provider.kind === "heuristic";
+  ui.chipWho.textContent = providerLabel(true);
+  ui.thinkProvider.textContent = providerLabel();
+  let cls = heuristic ? "local" : "idle";
+  let text = heuristic ? "本地" : "待命";
+  if (t && t.status === "thinking") {
+    cls = "thinking";
+    text = `思考中 ${fmtSec(Date.now() - t.startedAt)}${t.output || t.reasoning ? " · 流式输出中" : ""}`;
+  } else if (t && t.status === "ok") {
+    cls = "ok";
+    text = `已回复 ${fmtSec((t.endedAt ?? Date.now()) - t.startedAt)}`;
+  } else if (t && t.status === "fallback") {
+    cls = "fallback";
+    text = "失联 · 已回退内置机器人";
+    ui.chip.title = `AI 调用失败：${t.error ?? ""}\n点击查看详情`;
+  }
+  if (cls !== "fallback") ui.chip.title = "点击查看 AI 思考细节";
+  ui.chip.className = cls;
+  ui.chipState.textContent = text;
+  if (cls === "thinking" && !chipTimer) chipTimer = setInterval(renderChip, 200);
+  if (cls !== "thinking" && chipTimer) {
+    clearInterval(chipTimer);
+    chipTimer = undefined;
+  }
+}
+
+function traceStatusText(t: AiTrace): string {
+  const dur = fmtSec((t.endedAt ?? Date.now()) - t.startedAt);
+  switch (t.status) {
+    case "thinking":
+      return `思考中 ${dur}`;
+    case "ok":
+      return `模型已回复 · ${dur}`;
+    case "fallback":
+      return `失联，回退内置机器人 · ${dur}`;
+    default:
+      return "内置机器人";
+  }
+}
+
+function makeSection(title: string, cls: string): { sec: HTMLElement; pre: HTMLElement; n: HTMLElement } {
+  const sec = document.createElement("div");
+  sec.className = "sec";
+  const h = document.createElement("div");
+  h.className = "h";
+  const n = document.createElement("span");
+  n.className = "n";
+  h.append(title, n);
+  const pre = document.createElement("pre");
+  pre.className = cls;
+  sec.append(h, pre);
+  return { sec, pre, n };
+}
+
+function buildTraceView(t: AiTrace): void {
+  const root = document.createElement("details");
+  root.className = `trace ${t.status}`;
+  root.open = true;
+  const sum = document.createElement("summary");
+  const arrow = document.createElement("span");
+  arrow.className = "arrow";
+  arrow.textContent = "▶";
+  const rt = document.createElement("span");
+  rt.className = "rt";
+  rt.textContent = `R${t.round}`;
+  const task = document.createElement("span");
+  task.className = "task";
+  task.textContent = t.kind === "select" ? "选牌" : "下注";
+  const st = document.createElement("span");
+  st.className = "st";
+  sum.append(arrow, rt, task, st);
+  const body = document.createElement("div");
+  body.className = "body";
+
+  const result = document.createElement("div");
+  result.className = "result";
+  const meta = document.createElement("div");
+  meta.className = "meta";
+
+  const prompt = document.createElement("details");
+  prompt.className = "sub";
+  const ps = document.createElement("summary");
+  ps.textContent = "提示词（发给模型的完整内容）";
+  const pre1 = document.createElement("pre");
+  pre1.textContent = `[system]\n${t.system}\n\n[user]\n${t.user}`;
+  prompt.append(ps, pre1);
+  if (t.status === "heuristic") prompt.classList.add("hidden");
+
+  const r = makeSection("推理", "reasoning");
+  const o = makeSection("回复（原文）", "output");
+  const e = makeSection("错误", "err");
+
+  body.append(result, meta, r.sec, o.sec, e.sec, prompt);
+  root.append(sum, body);
+  traceViews.set(t.id, {
+    root,
+    st,
+    reasoning: r.pre,
+    output: o.pre,
+    result,
+    meta,
+    secReasoning: r.sec,
+    secOutput: o.sec,
+    secErr: e.sec,
+    err: e.pre,
+    rn: r.n,
+    on: o.n
+  });
+  ui.thinkBody.querySelector(".tp-empty")?.remove();
+  // 新记录放最上面，旧记录自动折叠。
+  for (const v of traceViews.values()) if (v.root !== root) v.root.open = false;
+  ui.thinkBody.prepend(root);
+}
+
+function updateTraceView(t: AiTrace): void {
+  const v = traceViews.get(t.id);
+  if (!v) return;
+  v.root.className = `trace ${t.status}`;
+  v.st.textContent = traceStatusText(t);
+  const streaming = t.status === "thinking";
+  v.secReasoning.classList.toggle("hidden", !t.reasoning && !streaming);
+  v.secOutput.classList.toggle("hidden", !t.output && !streaming && t.status !== "heuristic");
+  if (t.status === "heuristic") {
+    v.secReasoning.classList.add("hidden");
+    v.secOutput.classList.add("hidden");
+  }
+  const atBottom = (el: HTMLElement) => el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  const setStream = (el: HTMLElement, text: string, placeholder: string) => {
+    const stick = atBottom(el);
+    el.textContent = text || (streaming ? placeholder : "");
+    el.classList.toggle("cursor", streaming);
+    if (stick) el.scrollTop = el.scrollHeight;
+  };
+  setStream(v.reasoning, t.reasoning, "等待模型输出推理…");
+  setStream(v.output, t.output, "等待模型回复…");
+  v.rn.textContent = t.reasoning ? `${t.reasoning.length} 字` : "";
+  v.on.textContent = t.output ? `${t.output.length} 字` : "";
+  v.secErr.classList.toggle("hidden", !t.error);
+  v.err.textContent = t.error ?? "";
+  v.result.innerHTML = t.summary ? `<b>决策</b> ${escapeHtml(t.summary)}` : streaming ? "<b>决策</b> 尚未得出…" : "";
+  const meta: string[] = [];
+  if (t.attempt > 1) meta.push(`<span class="cut">第 ${t.attempt} 次尝试</span>`);
+  if (t.usage?.input != null) {
+    const cached = t.usage.cached ?? 0;
+    meta.push(`输入 ${t.usage.input} tokens`);
+    meta.push(cached > 0 ? `<span class="hit">缓存命中 ${cached}（${Math.round((cached / t.usage.input) * 100)}%）</span>` : "缓存命中 0");
+  }
+  if (t.usage?.output != null) meta.push(`输出 ${t.usage.output} tokens`);
+  if (t.finishReason === "length") meta.push(`<span class="cut">输出被长度上限截断</span>`);
+  v.meta.innerHTML = meta.join(" · ");
+  v.meta.classList.toggle("hidden", meta.length === 0);
+}
+
+function onTrace(t: AiTrace): void {
+  if (!traces.includes(t)) {
+    traces.push(t);
+    while (traces.length > MAX_TRACES) {
+      const old = traces.shift()!;
+      traceViews.get(old.id)?.root.remove();
+      traceViews.delete(old.id);
+    }
+    buildTraceView(t);
+  }
+  currentTrace = t;
+  updateTraceView(t);
+  renderChip();
+}
+
+function toggleThinkPanel(force?: boolean): void {
+  const show = force ?? ui.thinkPanel.classList.contains("hidden");
+  ui.thinkPanel.classList.toggle("hidden", !show);
+  ui.log.classList.toggle("pushed", show);
+}
+
+/** 开局面板里的「对手 AI」摘要。 */
+function aiSummaryHtml(): { html: string; cls: string } {
   const p = settings.provider;
-  return p.kind === "heuristic" ? "内置机器人" : `${p.presetId} · ${p.model}`;
+  const { label, model } = providerDisplayName(p);
+  if (p.kind === "heuristic") {
+    return { html: `<b>${escapeHtml(label)}</b><small>离线概率模型，不需要 API。想让大模型来扮演和也，点右侧按钮选择。</small>`, cls: "" };
+  }
+  const head = `<b>${escapeHtml(label)}</b> · ${escapeHtml(model || "（未填模型）")}`;
+  if (!p.apiKey && p.kind !== "openai-compatible") {
+    return { html: `${head}<small>尚未填写 API 密钥，开局后每次决策都会失败并回退到内置机器人。</small>`, cls: "bad" };
+  }
+  if (!model) return { html: `${head}<small>模型名为空，请先在设置里选择模型。</small>`, cls: "warn" };
+  const host = (() => {
+    try {
+      return new URL(p.baseUrl).host;
+    } catch {
+      return p.baseUrl;
+    }
+  })();
+  return { html: `${head}<small>${escapeHtml(host)}${p.apiKey ? " · 密钥已填" : " · 无密钥"} · 超时 ${Math.round(p.timeoutMs / 1000)}s</small>`, cls: "" };
 }
 
 // ---------- 渲染 ----------
@@ -89,7 +314,10 @@ function render(): void {
     if (!P.chosen) status = "点击你的一张手牌，盖着打出。";
     else if (!A.chosen) status = "和也正在选牌…";
   } else if (state.phase === "betting") {
-    status = state.toAct === "player" ? `轮到你下注。你打出的是 ${cardLabel(P.chosen!)}。` : "和也正在思考…";
+    const last = state.actions[state.actions.length - 1];
+    if (state.toAct !== "player") status = "和也正在思考…";
+    else if (last?.type === "call") status = `和也跟注了。你可以过牌开牌，或继续加注。你打出的是 ${cardLabel(P.chosen!)}。`;
+    else status = `轮到你下注。你打出的是 ${cardLabel(P.chosen!)}。`;
   } else if (state.phase === "showdown" || state.phase === "gameover") {
     const r = state.lastResult!;
     const cards = `${cardLabel(P.chosen!)} 对 ${cardLabel(A.chosen!)}`;
@@ -149,7 +377,7 @@ function escapeHtml(s: string): string {
 
 let bubbleTimer: ReturnType<typeof setTimeout> | undefined;
 function speak(decision: AiDecision): void {
-  const note = decision.source === "llm" ? providerLabel() : `内置机器人${decision.error ? "（API 失败，已回退）" : ""}`;
+  const note = decision.source === "llm" ? providerLabel() : `内置机器人${decision.error ? `（${providerLabel()} 失联，已回退）` : ""}`;
   ui.bubbleText.innerHTML = `${escapeHtml(decision.say)}<small>${escapeHtml(note)}</small>`;
   ui.bubble.classList.remove("hidden");
   clearTimeout(bubbleTimer);
@@ -174,9 +402,24 @@ function screenFlash(cls: "win" | "lose"): void {
 
 // ---------- 对局流程 ----------
 
+function clearTraces(): void {
+  traces.length = 0;
+  for (const v of traceViews.values()) v.root.remove();
+  traceViews.clear();
+  currentTrace = undefined;
+  if (!ui.thinkBody.querySelector(".tp-empty")) {
+    const empty = document.createElement("div");
+    empty.className = "tp-empty";
+    empty.textContent = "还没有任何决策。轮到和也时，这里会实时显示模型的推理与回复。";
+    ui.thinkBody.append(empty);
+  }
+  renderChip();
+}
+
 function beginGame(match: MatchSettings): void {
   gameId += 1;
   aiBusy = false;
+  clearTraces();
   hideBanner();
   ui.overlay.classList.add("hidden");
   ui.bubble.classList.add("hidden");
@@ -202,7 +445,7 @@ async function aiThink<T>(fn: () => Promise<T>): Promise<T> {
 async function aiSelect(): Promise<void> {
   const id = gameId;
   const round = state.round;
-  const decision = await aiThink(() => decide(state, "select", settings.provider));
+  const decision = await aiThink(() => decide(state, "select", settings.provider, onTrace));
   if (id !== gameId || state.round !== round || state.phase !== "select" || state.players.ai.chosen) return;
   selectCard(state, "ai", decision.cardId!);
   speak(decision);
@@ -231,7 +474,7 @@ async function aiBet(): Promise<void> {
   aiBusy = true;
   render();
   try {
-    const decision = await aiThink(() => decide(state, "bet", settings.provider));
+    const decision = await aiThink(() => decide(state, "bet", settings.provider, onTrace));
     if (id !== gameId || state.round !== round || state.phase !== "betting" || state.toAct !== "ai") return;
     const bet = decision.bet!;
     const stakeBefore = state.players.ai.stake;
@@ -352,15 +595,28 @@ const setupPanel = initSetupPanel({
   onStart(match) {
     settings = { ...settings, match };
     beginGame(match);
+  },
+  onPickAi() {
+    settingsPanel.open();
   }
 });
-const openSetup = () => setupPanel.open(loadSettings().match);
+const refreshAiSummary = () => {
+  const { html, cls } = aiSummaryHtml();
+  setupPanel.setAiSummary(html, cls);
+};
+const openSetup = () => {
+  refreshAiSummary();
+  setupPanel.open(loadSettings().match);
+};
 $("btn-new").addEventListener("click", openSetup);
 $("overlay-btn").addEventListener("click", openSetup);
 
 const settingsPanel = initSettingsPanel(settings, {
   onSave(next) {
     settings = next;
+    currentTrace = undefined;
+    renderChip();
+    refreshAiSummary();
     if (state) {
       state.log.push({ round: state.round, text: `AI 供应商已设为 ${providerLabel()}。` });
       renderLog();
@@ -370,10 +626,14 @@ const settingsPanel = initSettingsPanel(settings, {
   listModels
 });
 $("btn-settings").addEventListener("click", () => settingsPanel.open());
+$("btn-think").addEventListener("click", () => toggleThinkPanel());
+ui.chip.addEventListener("click", () => toggleThinkPanel());
+$("tp-close").addEventListener("click", () => toggleThinkPanel(false));
+renderChip();
 $("btn-rules").addEventListener("click", () => $("modal-rules").classList.remove("hidden"));
 $("rules-close").addEventListener("click", () => $("modal-rules").classList.add("hidden"));
 $("btn-prompt").addEventListener("click", () => {
-  $("prompt-system").textContent = SYSTEM_PROMPT;
+  $("prompt-system").textContent = FULL_SYSTEM_PROMPT;
   const kind = state && state.phase === "betting" ? "bet" : "select";
   $("prompt-user").textContent = state ? buildUserPrompt(buildObservation(state, kind)) : "（尚未开始对局）";
   $("modal-prompt").classList.remove("hidden");
@@ -399,6 +659,7 @@ openSetup();
   },
   table,
   pick: onPlayerPick,
+  traces,
   start: (match: MatchSettings) => {
     $("modal-setup").classList.add("hidden");
     beginGame(match);

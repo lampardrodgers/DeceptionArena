@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>One Poker · 赌博堕天录 开司 和也篇</title>
-    <link rel="icon" href="data:," />
+    <link rel="icon" type="image/png" sizes="512x512" href="./onepoker-web-icon.png?v=1" />
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
@@ -15,12 +15,18 @@
       <div id="hud">
         <div id="topbar">
           <div class="stat ai" id="stat-ai"><span class="name">和也</span><span class="lives">12</span><span class="tag">命</span></div>
+          <button id="ai-chip" class="idle" title="点击查看 AI 思考细节">
+            <span class="dot"></span>
+            <span class="who" id="ai-chip-who">内置机器人</span>
+            <span class="state" id="ai-chip-state">待命</span>
+          </button>
           <div id="round-info">第 — 回合</div>
           <div class="stat player" id="stat-player"><span class="name">开司</span><span class="lives">12</span><span class="tag">命</span></div>
           <div id="topbar-buttons">
             <button id="btn-rules" class="ghost">规则</button>
             <button id="btn-prompt" class="ghost">AI 提示词</button>
             <button id="btn-settings" class="ghost">⚙ AI 设置</button>
+            <button id="btn-think" class="ghost">AI 思考</button>
             <button id="btn-new" class="ghost">新对局</button>
           </div>
         </div>
@@ -45,6 +51,15 @@
         </div>
         <div id="next-wrap" class="hidden"><button id="btn-next" class="action primary">下一回合 ⏎</button></div>
         <div id="log"></div>
+
+        <aside id="think-panel" class="hidden">
+          <div class="tp-head">
+            <span class="tp-title">AI 思考记录</span>
+            <span class="tp-provider" id="tp-provider"></span>
+            <button id="tp-close" class="ghost">✕</button>
+          </div>
+          <div id="tp-body"><div class="tp-empty">还没有任何决策。轮到和也时，这里会实时显示模型的推理与回复。</div></div>
+        </aside>
       </div>
 
       <div id="overlay" class="hidden">
@@ -89,6 +104,11 @@
             <button class="chip" data-preset="5,5">5 对 5</button>
             <button class="chip" data-preset="20,20">20 对 20</button>
           </div>
+          <div class="ai-pick">
+            <div class="who">对手 AI</div>
+            <div class="summary" id="setup-ai-summary"></div>
+            <button id="setup-ai-btn" class="action">选择 / 配置 AI</button>
+          </div>
           <label>第一回合先手
             <select id="setup-first">
               <option value="random">随机</option>
@@ -104,6 +124,12 @@
       <div id="modal-settings" class="modal hidden">
         <div class="modal-card">
           <h2>和也 AI 设置</h2>
+          <label>已保存的配置（保存在本浏览器）
+            <div class="row nowrap">
+              <select id="cfg-saved" disabled></select>
+              <button id="cfg-delete" class="action small" disabled>删除</button>
+            </div>
+          </label>
           <label>供应商
             <select id="cfg-provider"></select>
           </label>
@@ -125,8 +151,12 @@
             <label>温度 <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="0.7" /></label>
             <label>超时（秒） <input id="cfg-timeout" type="number" min="5" max="600" step="5" value="90" /></label>
           </div>
+          <label>推理强度（reasoning effort）
+            <select id="cfg-effort"></select>
+          </label>
+          <p class="notes">OpenAI 兼容接口发送 reasoning_effort；Claude 映射为 extended thinking 预算（低 2K / 中 8K / 高 16K，开启后温度参数失效）；Gemini 映射为 thinkingBudget。不支持该参数的模型可能报错，此时选「默认」。</p>
           <p class="notes" id="cfg-notes"></p>
-          <p class="notes">密钥只保存在本浏览器的 localStorage，并直接发送给对应供应商。AI 每次决策都会收到完整的规则说明和当前局面（点击顶栏「AI 提示词」查看）。</p>
+          <p class="notes">点「保存」后，这套地址 / 密钥 / 模型会记进上方「已保存的配置」，下次直接选用。密钥只保存在本浏览器的 localStorage，并直接发送给对应供应商。AI 每次决策都会收到完整的规则说明和当前局面（点击顶栏「AI 提示词」查看），推理过程可在「AI 思考」面板实时查看。</p>
           <div class="row">
             <button id="cfg-models" class="action">检测连通并列出模型</button>
             <button id="cfg-test" class="action">试跑一次对话</button>
@@ -158,7 +188,7 @@
             <li><b>牌堆</b>：三副去掉鬼牌的扑克（156 张）洗成一摞，开局用切牌卡随机切掉上方 0～30% 不用。牌堆用尽时把弃牌洗回。</li>
             <li><b>手牌</b>：双方各持 2 张。<b class="up">UP</b> = 8、9、10、J、Q、K、A；<b class="down">DOWN</b> = 2～7。双方面前的指示灯公开各自手牌中 UP / DOWN 的张数（红灯 = UP，蓝灯 = DOWN），但不显示具体哪张。</li>
             <li><b>出牌</b>：每回合双方各选 1 张盖着打出，然后下注，最后翻牌比大小。A 最大，唯一例外：<b>2 胜 A</b>。同点平局，赌注退回。花色无关。</li>
-            <li><b>下注</b>：以「命」为单位，每回合双方必须各押 1 命。先手可以过牌或加注；面对加注可以跟注、再加注或弃牌。加注上限为双方命数中较少的一方（全押）。弃牌把自己已押的命输给对方，之后双方的牌照样翻开。</li>
+            <li><b>下注</b>：以「命」为单位，每回合双方必须各押 1 命。先手可以过牌或加注；面对加注可以跟注、再加注或弃牌。跟注后不会立刻开牌：被跟注的一方还可以继续加注，或过牌表示不再加注，此时才开牌。押注到上限时直接开牌。加注上限为双方命数中较少的一方（全押）。弃牌把自己已押的命输给对方，之后双方的牌照样翻开。</li>
             <li><b>先手</b>：第一回合先手可在开局设置；之后由上一回合的胜者先手，平局则不变。</li>
             <li><b>补牌</b>：回合结束后打出的牌进入弃牌堆，双方各补 1 张，指示灯随之更新。</li>
             <li><b>胜负</b>：命数归零者破产败北。默认 12 命对 12 命，可在开局自由设置。</li>
