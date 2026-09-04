@@ -16,7 +16,8 @@ const GAMES = 40;
 const SEED = 11;
 const LIVES = 12;
 const MIN_RATE = 0.5;
-const TIMEOUT = 300000;
+// 阶段 C 之后单次决策约 200ms（留牌估值表 + 选牌固定点），整表跑完要十几分钟，超时相应放大。
+const TIMEOUT = 1800000;
 
 /** 中日文字符按两格宽度对齐。 */
 function pad(s: string, width: number): string {
@@ -86,9 +87,9 @@ describe("bench: 对各基准对手的胜率", () => {
  * 可以考虑调回 40 局。
  */
 const H2H: { label: string; lives: number; games: number; timeout: number; self: boolean }[] = [
-  { label: "快照 vs 快照（镜像自对局）", lives: 12, games: GAMES, timeout: 900000, self: true },
-  { label: "当前 vs 快照", lives: 12, games: GAMES, timeout: 900000, self: false },
-  { label: "当前 vs 快照", lives: 30, games: 6, timeout: 900000, self: false }
+  { label: "快照 vs 快照（镜像自对局）", lives: 12, games: GAMES, timeout: 2700000, self: true },
+  { label: "当前 vs 快照", lives: 12, games: GAMES, timeout: 2700000, self: false },
+  { label: "当前 vs 快照", lives: 30, games: 6, timeout: 2700000, self: false }
 ];
 
 describe("bench: 对 v0.1.10 快照头对头", () => {

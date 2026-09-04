@@ -185,6 +185,19 @@ export function historyPools(view: BotView): number[][] {
   return out;
 }
 
+/** 把「我的牌对上各点数的结果」（o：+1 胜 / −1 负 / 0 平）按分布 D 汇总成三个概率。 */
+export function outcomes(D: number[], o: number[]): { win: number; lose: number; draw: number } {
+  let win = 0;
+  let lose = 0;
+  let draw = 0;
+  for (const c of RANKS) {
+    if (o[c] > 0) win += D[c];
+    else if (o[c] < 0) lose += D[c];
+    else draw += D[c];
+  }
+  return { win, lose, draw };
+}
+
 export function normalize(d: number[]): number[] {
   let s = 0;
   for (const v of d) s += v;
