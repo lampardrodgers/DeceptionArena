@@ -4,3 +4,6 @@ dist
 .env.*
 !.env.example
 .DS_Store
+# bench 的结果 JSON 是本机跑出来的一次性产物，只留说明文件。
+bench/*
+!bench/README.md

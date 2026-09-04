@@ -8,7 +8,8 @@
     "dev": "vite --host 127.0.0.1 --port 13460",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 13461",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench": "vitest run src/ai/bench.test.ts --reporter=verbose"
   },
   "dependencies": {
     "three": "^0.170.0"

@@ -280,6 +280,165 @@ export const counterLearner: Strategy = {
   }
 };
 
+// ---------- 阶段 B 新增对手 ----------
+
+/** 开司本局自己已经加注过几次（公开动作）。 */
+const myRaises = (s: GameState) => s.actions.filter((a) => a.side === "player" && a.type === "raise").length;
+/** 底池赔率：跟注要付 callAmount，池子里已经有双方的押注。 */
+const price = (s: GameState, l: LegalBets) =>
+  l.callAmount / (l.callAmount + s.players.player.stake + s.players.ai.stake);
+
+/**
+ * 阶梯小注：开局与回应一律最小加注，被再加注之后才按牌力（q）跟 / 弃。
+ *
+ * 它测的是「机器人对连续小注的防守」：每一步单看都便宜到必须跟，
+ * 但一路跟下去就是把全部押注额送进一个自己没有主动权的池子。
+ */
+export const minRaiseLadder: Strategy = {
+  name: "阶梯小注",
+  select: tight.select,
+  bet: (s) => {
+    const l = legalBets(s, "player");
+    const p = q(s, s.players.player.chosen!);
+    const steps = myRaises(s);
+    if (!l.canCall) {
+      // 双方押注相同：开局 / 机器人过牌之后，一律最小加注。
+      return l.canRaise ? rise(l, l.minRaiseTo) : { type: "check" };
+    }
+    // 面对加注：第一次仍然按阶梯回敬一手最小加注，第二次起才看牌力。
+    if (l.canRaise && (steps === 0 || (steps === 1 && p > 0.35))) return rise(l, l.minRaiseTo);
+    return p >= price(s, l) + 0.05 ? { type: "call" } : { type: "fold" };
+  }
+};
+
+/**
+ * MIX 诈唬：指示灯是 UP1+DOWN1 时 70% 打出 DOWN 牌并最小加注，其余情况按稳健型打。
+ *
+ * 专门喂 D5 的「MIX 灯下选牌 + 加注」联合统计：机器人若只按「加注 = 强牌」的先验读它，
+ * 就会在 MIX 局里被小注一路压掉；学会之后跟注率应当随局数上升（见 metrics 的 adaptationCurve）。
+ */
+export const mixDownBluffer: Strategy = {
+  name: "MIX 诈唬",
+  select: (s, rng) => {
+    const [a, b] = s.players.player.hand;
+    if (isUp(a) !== isUp(b) && rng() < 0.7) return (isUp(a) ? b : a).id;
+    return tight.select(s, rng);
+  },
+  bet: (s, rng) => {
+    const l = legalBets(s, "player");
+    const c = s.players.player.chosen!;
+    const kept = s.players.player.hand[0];
+    // 「这一局是 MIX 灯而且我打出了 DOWN」——从公开的牌面就能复原，不需要额外状态。
+    const bluffing = !isUp(c) && kept != null && isUp(kept);
+    if (!bluffing) return tight.bet(s, rng);
+    const p = q(s, c);
+    if (l.canRaise && myRaises(s) < 2) return rise(l, l.minRaiseTo);
+    if (l.canCall) return p > 0.7 ? { type: "call" } : { type: "fold" };
+    return { type: "check" };
+  }
+};
+
+/** `onlineReader` 在线统计出来的「机器人加注额 → 摊牌牌力」相关。 */
+export interface SizingRead {
+  /** 大码（f ≥ 0.5）样本数与平均绝对牌力。 */
+  bigN: number;
+  bigMean: number;
+  /** 小码 / 过牌样本数与平均绝对牌力。 */
+  smallN: number;
+  smallMean: number;
+  /** bigMean − smallMean：> 0 说明「码越大牌越强」，也就是可读。 */
+  edge: number;
+}
+
+/**
+ * 只用公开信息在线统计机器人「首个动作的加注额 → 摊牌时露出的点数」。
+ * 每局结束时双方的牌都会翻开（`RoundRecord.cards`），所以这是开司真的看得到的东西。
+ */
+export function readBotSizing(s: GameState, rounds = 40): SizingRead {
+  const big: number[] = [];
+  const small: number[] = [];
+  for (const r of s.history.slice(-rounds)) {
+    const card = r.cards.ai;
+    if (!card) continue;
+    // 那一局的押注上限没记在 RoundRecord 里，从结算后的命数反推：M = min(开打前双方的命数)。
+    const moved = r.result === "draw" ? 0 : r.livesMoved;
+    const before = {
+      player: r.livesAfter.player + (r.result === "ai" ? moved : -moved),
+      ai: r.livesAfter.ai + (r.result === "player" ? moved : -moved)
+    };
+    const M = Math.min(before.player, before.ai);
+    const st: Record<Side, number> = { player: 1, ai: 1 };
+    let done = false;
+    for (const a of r.actions) {
+      if (!done && a.side === "ai" && st.ai === st.player) {
+        const span = M - st.ai;
+        const f = a.type === "raise" && span > 0 ? ((a.raiseTo ?? st.ai) - st.ai) / span : 0;
+        (f >= 0.5 ? big : small).push(absRankStrength(card.rank));
+        done = true;
+      }
+      if (a.type === "raise") st[a.side] = a.raiseTo ?? st[a.side];
+      else if (a.type === "call") st[a.side] = st[a.side === "ai" ? "player" : "ai"];
+    }
+  }
+  const mean = (xs: number[]) => (xs.length > 0 ? xs.reduce((a, b) => a + b, 0) / xs.length : 0.5);
+  const bigMean = mean(big);
+  const smallMean = mean(small);
+  return { bigN: big.length, bigMean, smallN: small.length, smallMean, edge: bigMean - smallMean };
+}
+
+/**
+ * 在线读牌：一边打一边统计机器人「加注额 → 摊牌牌力」的相关，再按统计结果调整打法。
+ *
+ * 相关显著（大码平均牌力比小码 / 过牌高 0.12 以上，且两边各有 ≥ 4 个样本）时：
+ * 对大码只用绝强牌跟，对小码 / 过牌全面施压。相关不显著就退回稳健型。
+ * 它衡量的是「机器人的可读性到底能被榨出多少」——机器人越难读，这一行的胜率越低。
+ */
+export const onlineReader: Strategy = {
+  name: "在线读牌",
+  select: tight.select,
+  bet: (s, rng) => {
+    const l = legalBets(s, "player");
+    const p = q(s, s.players.player.chosen!);
+    const r = readBotSizing(s);
+    const readable = r.bigN >= 4 && r.smallN >= 4 && r.edge >= 0.12;
+    if (!readable) return tight.bet(s, rng);
+    const spanFaced = s.maxStake - s.players.player.stake;
+    const facingBig = l.canCall && spanFaced > 0 && l.callAmount / spanFaced >= 0.5;
+    if (l.canCall) {
+      // 大码 = 强牌（他自己教我们的）：只有绝强牌才跟。
+      if (facingBig) return p >= 0.9 ? { type: "call" } : { type: "fold" };
+      // 小码 / 过牌 = 弱牌：便宜就跟，顺手再压一手。
+      if (l.canRaise && p >= 0.45) return rise(l, l.minRaiseTo + 1);
+      return p >= price(s, l) ? { type: "call" } : { type: "fold" };
+    }
+    if (l.canRaise && (botChecked(s) || p >= 0.4)) return rise(l, l.minRaiseTo + 1);
+    return { type: "check" };
+  }
+};
+
+/**
+ * 陷阱型（慢打）：强牌先过牌或最小加注，等机器人加注之后再重加。
+ * 中等牌按底池赔率跟 / 弃，弱牌偶尔最小加注偷一手。
+ */
+export const trapper: Strategy = {
+  name: "陷阱",
+  select: tight.select,
+  bet: (s, rng) => {
+    const l = legalBets(s, "player");
+    const p = q(s, s.players.player.chosen!);
+    const strong = p >= 0.75;
+    if (l.canCall) {
+      // 他咬钩了：这时候才把码打上去。
+      if (strong && l.canRaise) return rise(l, Math.max(l.minRaiseTo, Math.round(l.minRaiseTo + (l.maxRaiseTo - l.minRaiseTo) * 0.8)));
+      return p >= price(s, l) + 0.03 || (l.callAmount <= 1 && p > 0.25) ? { type: "call" } : { type: "fold" };
+    }
+    // 双方押注相同：强牌一半过牌、一半最小加注（钓鱼），弱牌偶尔最小偷。
+    if (strong && l.canRaise && rng() < 0.5) return rise(l, l.minRaiseTo);
+    if (!strong && p < 0.25 && l.canRaise && rng() < 0.25) return rise(l, l.minRaiseTo);
+    return l.canCheck ? { type: "check" } : { type: "call" };
+  }
+};
+
 /** 全部基准对手，按「越靠后越针对机器人的可读性」排列。 */
 export const BENCH_STRATEGIES: Strategy[] = [
   random,
@@ -292,13 +451,84 @@ export const BENCH_STRATEGIES: Strategy[] = [
   bluffer,
   switcher,
   sizeSwitcher,
-  counterLearner
+  counterLearner,
+  minRaiseLadder,
+  mixDownBluffer,
+  onlineReader,
+  trapper
 ];
 
-export function simulate(kaiji: Strategy, games: number, seed: number, lives = 12, bot: BotSide = { select: botSelect, bet: botBet, view: publicView }): { wins: number; losses: number; rounds: number } {
+/**
+ * 英文 id → 策略。环境变量里写中文名很难受（引号 / 编码 / 补全都不方便），
+ * 所以 `BENCH_OPPONENTS` 两种写法都收：`BENCH_OPPONENTS=tight,onlineReader` 或中文名。
+ */
+export const STRATEGY_IDS: Record<string, Strategy> = {
+  random,
+  station,
+  tight,
+  oldBot,
+  checkPunisher,
+  tellReader,
+  polarized,
+  bluffer,
+  switcher,
+  sizeSwitcher,
+  counterLearner,
+  minRaiseLadder,
+  mixDownBluffer,
+  onlineReader,
+  trapper
+};
+
+/** 按英文 id 或中文名取基准对手（`BENCH_OPPONENTS` 环境变量用）。 */
+export function strategyByName(name: string): Strategy | undefined {
+  const key = name.trim();
+  return STRATEGY_IDS[key] ?? BENCH_STRATEGIES.find((s) => s.name === key);
+}
+
+/** 策略 → 英文 id（写 JSON 时用，中文名当 key 不好在别处引用）。 */
+export function strategyId(s: Strategy): string {
+  return Object.keys(STRATEGY_IDS).find((k) => STRATEGY_IDS[k] === s) ?? s.name;
+}
+
+/**
+ * 一局之内的观察钩子。`metrics.ts` 用它把「机器人看到什么 / 做了什么」摘出来，
+ * 这样所有指标都跑在同一个对局循环上，不必各写一遍。
+ */
+export interface MatchHooks {
+  /** 机器人选牌之前（`view.hand` 还是两张，`view.chosen` 为 null）。 */
+  onBeforeSelect?(s: GameState, view: BotView): void;
+  /** 机器人选牌之后。 */
+  onSelect?(s: GameState, cardId: string): void;
+  /** 机器人每次下注决策：`view` 是决策前的公开视图，`bet` 是它打出的动作。 */
+  onBotBet?(s: GameState, view: BotView, bet: BetInput): void;
+  /** 一局结算之后（`rec` 是刚写进 history 的那条）。 */
+  onRoundEnd?(s: GameState, rec: RoundRecord): void;
+}
+
+export interface SimResult {
+  wins: number;
+  losses: number;
+  rounds: number;
+  /** `botBet` 单次决策耗时。 */
+  bet: LatencyStats;
+  /** `botSelect` 单次决策耗时。 */
+  select: LatencyStats;
+}
+
+export function simulate(
+  kaiji: Strategy,
+  games: number,
+  seed: number,
+  lives = 12,
+  bot: BotSide = { select: botSelect, bet: botBet, view: publicView },
+  hooks: MatchHooks = {}
+): SimResult {
   let wins = 0;
   let losses = 0;
   let rounds = 0;
+  const betMs: number[] = [];
+  const selectMs: number[] = [];
   for (let g = 0; g < games; g += 1) {
     const rng = seededRng(seed * 1000 + g);
     const s = newGame({ rng, firstMover: "random", playerLives: lives, aiLives: lives });
@@ -306,13 +536,26 @@ export function simulate(kaiji: Strategy, games: number, seed: number, lives = 1
     let guard = 0;
     while (s.phase !== "gameover" && guard < 600) {
       guard += 1;
-      selectCard(s, "ai", bot.select(bot.view(s), rng).cardId!);
+      const selView = bot.view(s);
+      hooks.onBeforeSelect?.(s, selView);
+      const t0 = performance.now();
+      const sel = bot.select(selView, rng);
+      selectMs.push(performance.now() - t0);
+      selectCard(s, "ai", sel.cardId!);
+      hooks.onSelect?.(s, sel.cardId!);
       selectCard(s, "player", kaiji.select(s, rng));
       while (s.phase === "betting") {
-        if (s.toAct === "ai") act(s, "ai", bot.bet(bot.view(s), rng).bet!);
-        else act(s, "player", kaiji.bet(s, rng));
+        if (s.toAct === "ai") {
+          const view = bot.view(s);
+          const t1 = performance.now();
+          const d = bot.bet(view, rng);
+          betMs.push(performance.now() - t1);
+          hooks.onBotBet?.(s, view, d.bet!);
+          act(s, "ai", d.bet!);
+        } else act(s, "player", kaiji.bet(s, rng));
       }
       rounds += 1;
+      if (s.lastResult) hooks.onRoundEnd?.(s, s.lastResult);
       if (s.phase === "showdown") {
         clearTable(s);
         startRound(s, rng);
@@ -322,7 +565,7 @@ export function simulate(kaiji: Strategy, games: number, seed: number, lives = 1
     if (aiWon) wins += 1;
     else losses += 1;
   }
-  return { wins, losses, rounds };
+  return { wins, losses, rounds, bet: latency(betMs), select: latency(selectMs) };
 }
 
 
