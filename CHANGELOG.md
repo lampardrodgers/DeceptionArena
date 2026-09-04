@@ -1,6 +1,16 @@
 # Changelog
 
+## OnePoker-v0.1.10 - 2026-09-04
+
+- Corrected the release metadata so the package version and changelog history match the published OnePoker updates.
+
 ## OnePoker-v0.1.9 - 2026-09-04
+
+- Improved the mobile layout with a dynamic viewport, safe-area support, touch-friendly controls, responsive top-bar/actions, and dedicated portrait/landscape arrangements.
+- Moved result banners below the top bar and resized table cards/action areas so they do not overlap on short mobile screens.
+- Added the OnePoker deployment configuration for `onepoker.995003.xyz`.
+
+## OnePoker-v0.1.8 - 2026-09-03
 
 - Replaced the built-in heuristic with an algorithmic Kazuya bot (`src/ai/bot.ts`): card counting over the three-deck shoe and discard pile, Bayesian tracking of the card Kaiji keeps between rounds, per-player tendency models learned from match history (DOWN-from-mixed-hand preference, same-category card ordering, raise/fold/re-raise rates by hand strength, raise sizing), betting actions treated as evidence, and expected-value search over every legal bet with a two-ply opponent response model. Utility is match-win probability, so the bot declines marginal all-ins when ahead and gambles when short.
 - Fixed unknown-card counting, which compared against a single 52-card deck and therefore never removed revealed or held cards; the LLM prompt's `unknownCardsByRank` and `estimatedWinProbability` now use the bot's card counter and belief model.
