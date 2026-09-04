@@ -21,7 +21,7 @@ import {
   type GameState
 } from "./game/engine.js";
 import { TableScene } from "./scene/table.js";
-import { initSettingsPanel, initSetupPanel, loadSettings, type AppSettings, type MatchSettings } from "./ui/settings.js";
+import { initSettingsPanel, initSetupPanel, loadSettings, saveSettings, type AppSettings, type MatchSettings } from "./ui/settings.js";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
@@ -69,7 +69,8 @@ const ui = {
   chipState: $("ai-chip-state"),
   thinkPanel: $("think-panel"),
   thinkBody: $("tp-body"),
-  thinkProvider: $("tp-provider")
+  thinkProvider: $("tp-provider"),
+  thinkHide: $<HTMLInputElement>("tp-hide")
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -85,7 +86,7 @@ function providerLabel(short = false): string {
 const MAX_TRACES = 40;
 const traces: AiTrace[] = [];
 /** 每条记录对应的 DOM 引用，流式更新时只改文本，不重建，避免用户展开的状态被重置。 */
-const traceViews = new Map<number, { root: HTMLDetailsElement; st: HTMLElement; reasoning: HTMLElement; output: HTMLElement; result: HTMLElement; meta: HTMLElement; secReasoning: HTMLElement; secOutput: HTMLElement; secErr: HTMLElement; err: HTMLElement; rn: HTMLElement; on: HTMLElement }>();
+const traceViews = new Map<number, { root: HTMLDetailsElement; st: HTMLElement; reasoning: HTMLElement; output: HTMLElement; result: HTMLElement; meta: HTMLElement; secReasoning: HTMLElement; secOutput: HTMLElement; secErr: HTMLElement; err: HTMLElement; rn: HTMLElement; on: HTMLElement; prompt: HTMLElement; veil: HTMLElement; round: number }>();
 let chipTimer: ReturnType<typeof setInterval> | undefined;
 let currentTrace: AiTrace | undefined;
 
@@ -185,7 +186,12 @@ function buildTraceView(t: AiTrace): void {
   const o = makeSection("回复（原文）", "output");
   const e = makeSection("错误", "err");
 
-  body.append(result, meta, r.sec, o.sec, e.sec, prompt);
+  // 本局未结束时用它替换全部内容：推理里会写明和也手里是什么牌。
+  const veil = document.createElement("div");
+  veil.className = "tp-veil hidden";
+  veil.textContent = "本局进行中，推理过程与决策说明已隐藏（结束后自动展开）。";
+
+  body.append(veil, result, meta, r.sec, o.sec, e.sec, prompt);
   root.append(sum, body);
   traceViews.set(t.id, {
     root,
@@ -199,7 +205,10 @@ function buildTraceView(t: AiTrace): void {
     secErr: e.sec,
     err: e.pre,
     rn: r.n,
-    on: o.n
+    on: o.n,
+    prompt,
+    veil,
+    round: t.round
   });
   ui.thinkBody.querySelector(".tp-empty")?.remove();
   // 新记录放最上面，旧记录自动折叠。
@@ -207,11 +216,24 @@ function buildTraceView(t: AiTrace): void {
   ui.thinkBody.prepend(root);
 }
 
+/**
+ * 本局是否已经翻牌。没翻牌之前，思考记录（推理、模型原文、提示词、决策说明）
+ * 都可能直接写着和也手里是什么牌 —— 大模型和内置机器人一视同仁。
+ */
+function roundRevealed(round: number): boolean {
+  if (!state) return true;
+  return round < state.round || state.phase === "showdown" || state.phase === "gameover";
+}
+
 function updateTraceView(t: AiTrace): void {
   const v = traceViews.get(t.id);
   if (!v) return;
   v.root.className = `trace ${t.status}`;
   v.st.textContent = traceStatusText(t);
+  const veiled = settings.hideTraceDuringRound && !roundRevealed(t.round);
+  v.veil.classList.toggle("hidden", !veiled);
+  for (const el of [v.result, v.meta, v.secReasoning, v.secOutput, v.secErr, v.prompt]) el.classList.toggle("veiled", veiled);
+  if (veiled) return;
   const streaming = t.status === "thinking";
   v.secReasoning.classList.toggle("hidden", !t.reasoning && !streaming);
   v.secOutput.classList.toggle("hidden", !t.output && !streaming && t.status !== "heuristic");
@@ -260,6 +282,11 @@ function onTrace(t: AiTrace): void {
   currentTrace = t;
   updateTraceView(t);
   renderChip();
+}
+
+/** 局面变化（尤其是翻牌）后重新渲染全部记录：该隐藏的隐藏，该展开的展开。 */
+function refreshTraceViews(): void {
+  for (const t of traces) updateTraceView(t);
 }
 
 function toggleThinkPanel(force?: boolean): void {
@@ -349,6 +376,7 @@ function render(): void {
 
   ui.nextWrap.classList.toggle("hidden", state.phase !== "showdown");
   renderLog();
+  refreshTraceViews();
 }
 
 function bump(el: HTMLElement): void {
@@ -523,6 +551,8 @@ function playerBet(input: BetInput): void {
 }
 
 function showResult(): void {
+  // 本局到此翻牌：思考记录可以解禁了。
+  refreshTraceViews();
   const r = state.lastResult!;
   const P = state.players.player;
   const A = state.players.ai;
@@ -629,6 +659,12 @@ const settingsPanel = initSettingsPanel(settings, {
 $("btn-settings").addEventListener("click", () => settingsPanel.open());
 $("btn-think").addEventListener("click", () => toggleThinkPanel());
 ui.chip.addEventListener("click", () => toggleThinkPanel());
+ui.thinkHide.checked = settings.hideTraceDuringRound;
+ui.thinkHide.addEventListener("change", () => {
+  settings = { ...settings, hideTraceDuringRound: ui.thinkHide.checked };
+  saveSettings(settings);
+  refreshTraceViews();
+});
 $("tp-close").addEventListener("click", () => toggleThinkPanel(false));
 renderChip();
 $("btn-rules").addEventListener("click", () => $("modal-rules").classList.remove("hidden"));
@@ -636,7 +672,13 @@ $("rules-close").addEventListener("click", () => $("modal-rules").classList.add(
 $("btn-prompt").addEventListener("click", () => {
   $("prompt-system").textContent = FULL_SYSTEM_PROMPT;
   const kind = state && state.phase === "betting" ? "bet" : "select";
-  $("prompt-user").textContent = state ? buildUserPrompt(buildObservation(state, kind)) : "（尚未开始对局）";
+  // 提示词里写着和也的手牌，和思考记录一样要遮。
+  const veiled = settings.hideTraceDuringRound && !roundRevealed(state ? state.round : 0);
+  $("prompt-user").textContent = !state
+    ? "（尚未开始对局）"
+    : veiled
+      ? "（本局进行中，用户消息含和也的手牌，已隐藏。本局结束后可查看，或取消勾选思考面板里的「本局中隐藏」。）"
+      : buildUserPrompt(buildObservation(state, kind));
   $("modal-prompt").classList.remove("hidden");
 });
 $("prompt-close").addEventListener("click", () => $("modal-prompt").classList.add("hidden"));

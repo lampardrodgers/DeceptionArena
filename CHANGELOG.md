@@ -1,5 +1,13 @@
 # Changelog
 
+## OnePoker-v0.1.11 - 2026-09-04
+
+- Replaced the built-in bot's root decision with a CFR+ / Restricted Nash Response solver (`src/ai/solver.ts`). The bot now solves the whole betting subgame for its **entire range** instead of picking the single best action for the one card it holds, so value hands and bluffs share the same raise sizes, strong hands occasionally check, and hands facing a raise defend at the pot-odds minimum. The old expected-value tree (`src/ai/bettingTree.ts`) is kept only for terminal valuation (`makeVal`, which still folds the kept card's next-round value into match-win probability).
+- The solver mixes exploitation and safety with a standard Restricted Nash Response: a root chance node makes Kaiji play the learned opponent model with probability `p` and a freely-optimising copy with probability `1 - p`, where `p` is the opponent model's confidence, so the bot exploits a well-understood opponent and falls back towards equilibrium against an unfamiliar one. Both copies share one public tree via separate reach vectors, and each player is given his own risk-averse match-win utility rather than a zero-sum negation, which stops the underdog side from degenerating into shoving every hand.
+- Betting decisions are now sampled from the solved average strategy (actions below 3% are pruned and the rest renormalised, sorted by probability so a fixed RNG still reproduces the most likely line); card selection scores each candidate by the solver's root value for that card, including the value of the card kept back. The AI thinking panel gained a range-strategy section: the RNR weight, how each rank in the range plays this spot, per-action expected values with Kaiji's fold rate, and Kaiji's view of the bot's range before and after the chosen action.
+- Solver internals: strict per-engine game tree with a three-raise cap, raise-size abstraction (six representative sizes for the first raise, min/all-in deeper, with the real historical amounts always injected so the actual line keeps exact stakes), vectorised regret matching+ over all 13 ranks at once, Linear-CFR regret weighting with quadratic strategy averaging so 200 iterations suffice, alternating passes that only propagate the learning side's counterfactual values, an average-strategy floor and opponent freezing that keep unreachable infosets from propping up non-credible threats.
+- Added `src/ai/solver.test.ts` covering range shape (bluffs and value bets in the same size, defence against a minimum raise, purity at `p = 1`, legality and normalisation of every infoset) and a solve-latency record.
+
 ## OnePoker-v0.1.10 - 2026-09-04
 
 - Corrected the release metadata so the package version and changelog history match the published OnePoker updates.

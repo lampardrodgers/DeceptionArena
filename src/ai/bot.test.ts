@@ -1,7 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { seededRng, type Rng } from "../game/cards.js";
-import { type BetInput, type GameState, type Side, act, clearTable, legalBets, newGame, selectCard, startRound } from "../game/engine.js";
-import { PARAMS, RANKS, analyze, botBet, botSelect, cmpRank, learnOpponent, matchWinProb, perceivedWin, publicView, unknownPool } from "./bot.js";
+import { seededRng, type Card, type Rng } from "../game/cards.js";
+import { type BetAction, type BetInput, type GameState, type Lights, type RoundRecord, type Side, act, clearTable, legalBets, newGame, selectCard, startRound } from "../game/engine.js";
+import {
+  type BotView,
+  MODEL_PARAMS,
+  PARAMS,
+  RANKS,
+  analyze,
+  botBet,
+  botSelect,
+  cmpRank,
+  learnOpponent,
+  matchWinProb,
+  opponentConfidence,
+  perceivedWin,
+  publicView,
+  rate,
+  unknownPool
+} from "./bot.js";
 import { type Strategy, oldBot, random, simulate, station, tight } from "./sim.js";
 
 /** 固定局面：从牌堆里抽指定点数塞进双方手里。 */
@@ -262,6 +278,204 @@ describe("endgame and counting details", () => {
     act(s, "player", { type: "call" });
     const d = botBet(publicView(s), first);
     expect(d.bet!.type).toBe("raise");
+  });
+});
+
+// ---------- 手工历史：q 完全可控 ----------
+
+/**
+ * 造一段对局历史直接喂给 learnOpponent。
+ *
+ * 我方指示灯固定 UP2，牌堆用 12 副（每点数 48 张），所以开司「自认为的胜率」只由他打出的点数决定，
+ * 且十几局之内几乎不漂移：8→7%（<20% 档）、10→36%（<40% 档）、J→50%（<60% 档）、A→93%（≥80% 档）。
+ */
+type Act = [Side, "check" | "call" | "fold" | "raise", number?];
+
+function scriptedRounds(rounds: { rank: number; acts: Act[] }[], lives = 40, myLights: Lights = { up: 2, down: 0 }): RoundRecord[] {
+  const card = (rank: number, tag: string): Card => ({ id: `${tag}-${rank}`, rank, suit: "S" });
+  return rounds.map((r, i) => {
+    const st: Record<Side, number> = { player: 1, ai: 1 };
+    const actions: BetAction[] = r.acts.map(([side, type, raiseTo]) => {
+      const op: Side = side === "ai" ? "player" : "ai";
+      if (type === "raise") st[side] = raiseTo!;
+      else if (type === "call") st[side] = st[op];
+      return { side, type, raiseTo, stakeAfter: st[side] } as BetAction;
+    });
+    return {
+      round: i + 1,
+      firstMover: r.acts[0][0],
+      // 我打出的是 DOWN 牌，不影响 UP 牌池，所以 q 只随开司自己出过的牌轻微漂移。
+      lights: { player: { up: 1, down: 1 }, ai: myLights },
+      cards: { player: card(r.rank, `p${i}`), ai: card(5, `a${i}`) },
+      actions,
+      result: "draw",
+      reason: "showdown",
+      livesMoved: 0,
+      // 双方命数决定本局押注上限 M，进而决定加注额落进哪个额度桶。
+      livesAfter: { player: lives, ai: lives }
+    };
+  });
+}
+
+function scriptedView(rounds: { rank: number; acts: Act[] }[]): BotView {
+  const myLights: Lights = { up: 2, down: 0 };
+  const history = scriptedRounds(rounds);
+  return {
+    round: rounds.length + 1,
+    decks: 12,
+    firstMover: "player",
+    lives: { ai: 40, player: 40 },
+    stakes: { ai: 1, player: 1 },
+    maxStake: 12,
+    hand: [],
+    chosen: null,
+    lights: { ai: myLights, player: { up: 1, down: 1 } },
+    actions: [],
+    history,
+    discard: [],
+    reshuffles: [],
+    legal: { canCheck: true, canCall: false, callAmount: 0, canRaise: true, minRaiseTo: 2, maxRaiseTo: 12, canFold: false }
+  };
+}
+
+const RAISE_OPEN: Act[] = [["player", "raise", 3], ["ai", "call"]];
+const CHECK_OPEN: Act[] = [["player", "check"], ["ai", "check"]];
+const RAISE_AFTER_MY_CHECK: Act[] = [["ai", "check"], ["player", "raise", 3], ["ai", "call"]];
+const CHECK_AFTER_MY_CHECK: Act[] = [["ai", "check"], ["player", "check"]];
+
+describe("opponent modelling v2", () => {
+  it("models a polarised opponent that raises only the nuts and the trash", () => {
+    // 只有 5 档 + 档内低斜率才表达得出「最弱和最强都加注、中间过牌」；
+    // 旧的 3 档 + SLOPE=3 强制档内单调，弱档一定低于中档。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      rounds.push({ rank: 8, acts: RAISE_OPEN }); // q≈7%
+      rounds.push({ rank: 14, acts: RAISE_OPEN }); // q≈93%
+      rounds.push({ rank: 11, acts: CHECK_OPEN }); // q≈50%
+    }
+    const m = learnOpponent(scriptedView(rounds));
+    expect(m.rounds).toBe(15);
+    expect(rate(m.agg.openFirst.vweak)).toBeGreaterThan(0.5);
+    expect(rate(m.agg.openFirst.vstrong)).toBeGreaterThan(0.5);
+    expect(rate(m.agg.openFirst.mid)).toBeLessThan(0.3);
+  });
+
+  it("separates stabbing after our check from opening first", () => {
+    // 同样的牌力（q≈36%），先手就过牌、看到我过牌就偷注。两种情境必须分开统计。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      rounds.push({ rank: 10, acts: CHECK_OPEN });
+      rounds.push({ rank: 10, acts: RAISE_AFTER_MY_CHECK });
+    }
+    const m = learnOpponent(scriptedView(rounds));
+    expect(rate(m.agg.stabAfterBotCheck.weak)).toBeGreaterThan(rate(m.agg.openFirst.weak) + 0.3);
+    expect(rate(m.agg.openFirst.weak)).toBeLessThan(0.25);
+  });
+
+  it("uses the raise size as evidence once it has seen how he sizes his bets", () => {
+    // 额度的先验刻意与牌力无关（加得大是强牌还是诈唬因人而异），所以这条证据必须先学。
+    // 历史里上限 6 命：拿 A（自认 93%）就全下到 6，拿 8（自认 7%）只最小加注到 2。
+    const hist: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 6; i += 1) {
+      hist.push({ rank: 14, acts: [["player", "raise", 6], ["ai", "call"]] });
+      hist.push({ rank: 8, acts: [["player", "raise", 2], ["ai", "call"]] });
+    }
+    const history = scriptedRounds(hist, 6);
+    const posterior = (raiseTo: number) => {
+      const s = setup({ ai: [10, 4], player: [14, 6], firstMover: "player", lives: 12 });
+      selectCard(s, "player", s.players.player.hand[0].id);
+      selectCard(s, "ai", s.players.ai.hand[0].id);
+      act(s, "player", { type: "raise", raiseTo });
+      const view = publicView(s);
+      return analyze({ ...view, round: history.length + 1, history }).posterior;
+    };
+    const strong = (d: number[]) => RANKS.filter((r) => r >= 12).reduce((sum, r) => sum + d[r], 0);
+    // 同一个「他加注了」，全下比最小加注读出的强牌明显更多。
+    expect(strong(posterior(12))).toBeGreaterThan(strong(posterior(2)) + 0.1);
+  });
+
+  it("reads no strength into the raise size before it has any evidence", () => {
+    // 没历史时额度分布各档相同，似然是个常数，归一化后完全抵消：与 V1 行为一致。
+    const posterior = (raiseTo: number) => {
+      const s = setup({ ai: [10, 4], player: [14, 6], firstMover: "player", lives: 12 });
+      selectCard(s, "player", s.players.player.hand[0].id);
+      selectCard(s, "ai", s.players.ai.hand[0].id);
+      act(s, "player", { type: "raise", raiseTo });
+      return analyze(publicView(s)).posterior;
+    };
+    const strong = (d: number[]) => RANKS.filter((r) => r >= 12).reduce((sum, r) => sum + d[r], 0);
+    expect(strong(posterior(12))).toBeCloseTo(strong(posterior(2)), 9);
+  });
+
+  it("lets the fast memory take over when the opponent switches gears", () => {
+    // 前 20 局老实过牌，后 10 局每手都加注：慢记忆还在被旧样本拖住，快记忆已经跟上。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 20; i += 1) rounds.push({ rank: 11, acts: CHECK_OPEN });
+    for (let i = 0; i < 10; i += 1) rounds.push({ rank: 11, acts: RAISE_OPEN });
+    const m = learnOpponent(scriptedView(rounds));
+    expect(m.wFast).toBeGreaterThan(0.5);
+    expect(rate(m.agg.openFirst.mid)).toBeGreaterThan(rate(m.slow.agg.openFirst.mid));
+    // 前后判若两人 → 稳定度下降，置信度也跟着降（阶段 B 用它决定敢剥削多少）。
+    expect(m.stability).toBeLessThan(0.8);
+    expect(m.confidence).toBeLessThan(MODEL_PARAMS.pMax);
+  });
+
+  it("keeps a steady opponent's memories in agreement and reports high confidence", () => {
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 30; i += 1) rounds.push({ rank: i % 2 ? 11 : 10, acts: i % 2 ? RAISE_OPEN : CHECK_AFTER_MY_CHECK });
+    const m = learnOpponent(scriptedView(rounds));
+    expect(m.stability).toBeGreaterThan(0.8);
+    expect(m.confidence).toBeGreaterThan(0.5);
+    // 没有任何历史时置信度退回下限。
+    expect(opponentConfidence({ nEff: 0, stability: 1 })).toBeCloseTo(MODEL_PARAMS.p0, 9);
+  });
+
+  it("falls back to the prior exactly when there is no history at all", () => {
+    const m = learnOpponent(scriptedView([]));
+    // 空历史下层级收缩不能凭空扭曲先验：三种情境都保持「牌越强越敢加注」的单调先验。
+    expect(rate(m.agg.openFirst.vweak)).toBeCloseTo(0.1, 9);
+    expect(rate(m.agg.openFirst.mid)).toBeCloseTo(0.3, 9);
+    expect(rate(m.agg.openFirst.vstrong)).toBeCloseTo(0.68, 9);
+    expect(rate(m.agg.stabAfterBotCheck.mid)).toBeGreaterThan(rate(m.agg.openFirst.mid));
+    expect(rate(m.agg.barrel.mid)).toBeLessThan(rate(m.agg.openFirst.mid));
+  });
+});
+
+describe("information leaks", () => {
+  it("never lets the spoken line depend on hand strength", () => {
+    const says = (ai: number[], player: number[]) =>
+      [0, 0.3, 0.55, 0.8, 0.99].map((v) => botSelect(publicView(setup({ ai, player })), () => v).say);
+    // 必胜的 K + J 和毫无胜算的 3 + 2，对同一组 rng 必须说出同一组台词。
+    expect(says([13, 11], [5, 3])).toEqual(says([3, 2], [13, 12]));
+  });
+});
+
+describe("situational defence", () => {
+  it("defends DOWN2 against a min-raise only after Kaiji has been seen playing the DOWN card from a mixed hand", () => {
+    // 玩家提出的场景：我方 DOWN2，开司 UP1+DOWN1 先手最小加注。
+    // 没有历史时，开司的出牌范围约七成是 UP 牌（对 DOWN2 必胜），弃牌是对的；
+    // 但若见过他多次从混合手里打出 DOWN 牌并加注，出牌先验就会翻转，拿 7 应当跟注。
+    const spot = (history: RoundRecord[]): BotView => {
+      const s = setup({ ai: [7, 3], player: [13, 4], firstMover: "player" });
+      selectCard(s, "player", s.players.player.hand[0].id);
+      selectCard(s, "ai", s.players.ai.hand[0].id);
+      act(s, "player", { type: "raise", raiseTo: 2 });
+      const view = publicView(s);
+      view.history = history;
+      view.round = history.length + 1;
+      view.decks = 12; // 与 scriptedRounds 的假设一致，避免手工历史把牌池扣成负数
+      return view;
+    };
+    expect(botBet(spot([]), first).bet?.type).toBe("fold");
+
+    const seen = scriptedRounds(
+      Array.from({ length: 16 }, (_, i) => ({ rank: [3, 4, 5, 6][i % 4], acts: RAISE_OPEN })),
+      40,
+      { up: 0, down: 2 }
+    );
+    const view = spot(seen);
+    expect(rate(learnOpponent(view).playDownWhenMixed.DOWN2)).toBeGreaterThan(0.6);
+    expect(botBet(view, first).bet?.type).toBe("call");
   });
 });
 

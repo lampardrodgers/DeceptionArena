@@ -18,6 +18,8 @@ export interface AppSettings {
   match: MatchSettings;
   /** 之前配置过的所有 API，按最近保存时间倒序。 */
   profiles: SavedProfile[];
+  /** 本局未结束时隐藏「AI 思考记录」的推理 / 回复 / 决策，避免从中读出和也的牌。 */
+  hideTraceDuringRound: boolean;
 }
 
 const KEY = "pokesolo.settings.v2";
@@ -37,7 +39,8 @@ export function defaultSettings(): AppSettings {
       reasoningEffort: ""
     },
     match: { playerLives: 12, aiLives: 12, firstMover: "random" },
-    profiles: []
+    profiles: [],
+    hideTraceDuringRound: true
   };
 }
 
@@ -67,7 +70,12 @@ export function loadSettings(): AppSettings {
     if (!profiles.length && provider.kind !== "heuristic" && (provider.apiKey || provider.model)) {
       profiles = upsertProfile([], provider);
     }
-    return { provider, match: { ...base.match, ...(parsed.match ?? {}) }, profiles };
+    return {
+      provider,
+      match: { ...base.match, ...(parsed.match ?? {}) },
+      profiles,
+      hideTraceDuringRound: parsed.hideTraceDuringRound ?? base.hideTraceDuringRound
+    };
   } catch {
     return base;
   }
