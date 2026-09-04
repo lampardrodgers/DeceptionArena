@@ -48,13 +48,18 @@ export const catOf = (c: Card): Cat => (isUp(c) ? "UP" : "DOWN");
  *  matchEdge：在 12 对 12 的参考局里，双方命数相等时我们自认为赢下整场的概率。越高越厌恶波动。
  *  edgeScaling：命数总量变化时曲线弯曲程度怎么变。0 = 与总量无关（60 对 60 和 12 对 12 态度一致）；
  *    1 = 每一命的折算比例固定（总量越大越谨慎，因为剩下的局数越多、越值得靠每局的小优势磨）。
- * 实测（见 CHANGELOG）：机器人每局有真实优势，所以较强的谨慎在各种命数下都更能赢。
+ * 实测（见 CHANGELOG 0.1.12）：1 在 30 对 30 时把曲线弯成「全下要 99.6% 胜率才肯跟」，对面随便一推我们就弃，
+ * 反而被磨光底注（对上一版 2/16）；0 则 10/16。12 对 12 是参考局，两者完全等价。
  */
 /**
- * oppEdge：求解器里开司复制体的风险态度（他自认为赢下整场的概率）。> 0 时求解器是一般和，
- * 开司按自己的凹曲线估值；0 表示严格零和（他的效用 = −我方效用）。见 solver.ts 顶部与 CHANGELOG。
+ * oppEdge：求解器里开司「自由复制体」的风险态度（他自认为赢下整场的概率）。> 0 时求解器是一般和，
+ * 开司按自己的曲线估值；0.5 = 风险中性（按命数线性）；0 表示严格零和（他的效用 = −我方效用）。
+ * 0.1.12 实测：0（零和）让复制体变成爱赌的推手，我方被推得 85–90% 弃牌，对上一版 35–40%；
+ * 0.9 让复制体没有任何证据就厌恶风险、见加注就弃，我方「大牌必胜、小牌必败」时出小牌诈唬
+ * 的比例回到 48%；0.5 两头都不假设（对手真实的风险态度交给对手模型去学），对上一版持平（≈60%），
+ * 那批格子降到 19%。见 solver.ts 顶部与 CHANGELOG。
  */
-export const PARAMS = { matchEdge: 0.9, edgeScaling: 1, solveEdge: 0.9, oppEdge: 0.9 };
+export const PARAMS = { matchEdge: 0.9, edgeScaling: 0, solveEdge: 0.9, oppEdge: 0.5 };
 const REF_T = 24;
 const rho = (T: number) => Math.pow(Math.pow((1 - PARAMS.matchEdge) / PARAMS.matchEdge, 2), Math.pow(T / REF_T, PARAMS.edgeScaling));
 

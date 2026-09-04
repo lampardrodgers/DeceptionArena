@@ -21,17 +21,17 @@
  * 的 EV 只差千分之几时，等权平均要上千次迭代才能把前几轮的探索噪声稀释掉，实测「必胜牌该加多大」
  * 这类局面 200 次就选错额度；加权之后同样 200 次就稳定选中最优额度，耗时不变。
  *
- * **严格零和**（v0.1.12 起）：开司的效用就是 `−val(rank, delta)`，不再有独立的 `valOpp`。
- * 之前给双方各配一条凹效用曲线（两人都不愿为 1 命的底池赌上整场）看着更「像人」，代价是：
- *   1. 那个博弈根本没有零和结构，`p = 0` 解出来的东西**不是纳什均衡**，也就谈不上「不可被反读」——
- *      而这正是引入求解器的全部理由；
- *   2. 可利用度无从定义，更无从测量。零和之后 `exploitability()`（见下）才有意义：
- *      NashConv = 双方各自最佳回应能多赚的效用之和，`p = 0` 时它就是标准可利用度。
- * 至于当初的顾虑 —— 令开司效用 = −我方效用时，`matchEdge = 0.9` 会让他成为自知只有 10% 胜算的
- * 绝对劣势方，效用曲线凸、极度爱好波动、最优策略退化成「每手全下」，逼得我方每手弃牌 ——
- * 那是**风险态度参数取值**的问题，不是零和结构的问题：现在由 `PARAMS.solveEdge`（求解专用，
- * 与展示 / 选牌用的 `PARAMS.matchEdge` 分家）单独控制曲率，调用方组装 `val` 时用它。
- * 默认两者都是 0.9，真正的取值由 Stage B 扫参决定（预期 0.65–0.8）。
+ * **零和还是一般和**（v0.1.12 的实测结论）：终局值由调用方以 `val(rank, delta)` 给出，开司的效用
+ * 默认是 `−val`（严格零和，`p = 0` 时解是纳什均衡，`exploitability()` 才是真正的可利用度）；
+ * 调用方也可以给 `valOpp`（一般和，开司按自己的曲线估值）。两种都试过：
+ *   - 严格零和 + `solveEdge = 0.9`：开司复制体的效用是我方凹曲线的镜像，他成了自知只有 10% 胜算、
+ *     效用凸、极度爱好波动的推手，我方面对加注 85–90% 弃牌，对上一版机器人 35–40%；
+ *     把 `solveEdge` 降下来救不回来（0.6 时轮到我方变成赌徒，10%）。
+ *   - 一般和 + 复制体也按 0.9 厌恶风险：H2H 恢复到 ≈60%，但复制体没有任何证据就见加注即弃，
+ *     我方「大牌必胜、小牌必败」时拿小牌诈唬的比例回到 48%。
+ *   - 一般和 + 复制体风险中性（`PARAMS.oppEdge = 0.5`，当前默认）：H2H 同样 ≈60%，
+ *     那批格子降到 19%。自由复制体不假设任何风险态度，对手真实的态度交给对手模型（RNR 的 p 那份）去学。
+ * 求解器本身不算效用，`solveEdge` / `oppEdge` 只是调用方组装 `val` / `valOpp` 时用的曲率。
  *
  * 终局值还按**我方打出的点数**分档（`val(rank, delta)`）：13 个点数共用一条 `val(delta)` 时，
  * 留在手里那张牌的下一局价值会被错配到所有点数上。
@@ -256,9 +256,9 @@ function buildTree(inp: SolveInput): Tree {
   const { M, actions } = inp;
   // 加注次数上限按真实历史抬高：现实已经打到第 k 次加注了，树里还得留得下「我再加一次、
   // 他再加一次」，否则当前信息集会被抽象逼成 call/fold 二选一，深层的再加注威胁全部消失。
-  let histRaises = 0;
-  for (const a of actions) if (a.type === "raise") histRaises += 1;
-  const maxR = Math.max(SOLVER_PARAMS.maxRaises, histRaises + 2);
+  // 但这个抬高只给「沿着现实这条线」的分支：偏离现实的分支仍按分岔点已有的加注数 + 2 封顶，
+  // 否则 30 命的最小加注拉锯（十几次加注）会让每个偏离分支都能再加十几次，树呈指数爆炸（实测 OOM）。
+  const budgetOf = (pathRaises: number) => Math.max(SOLVER_PARAMS.maxRaises, pathRaises + 2);
   const nodes: Node[] = [];
   let stratSize = 0;
 
@@ -274,8 +274,11 @@ function buildTree(inp: SolveInput): Tree {
    * turn: 0 = 轮到我，1 = 轮到开司。acted：本局是否已经有人行动过（决定「过牌」是让牌还是开牌）。
    * path：这个节点在真实动作史上的下标，−1 表示已经偏离现实。
    */
-  const rec = (sMe: number, sOpp: number, turn: 0 | 1, acted: boolean, raises: number, oppRaised: boolean, path: number): number => {
+  const rec = (sMe: number, sOpp: number, turn: 0 | 1, acted: boolean, raises: number, oppRaised: boolean, path: number, pathRaises: number): number => {
     const meActs = turn === 0;
+    // 还在现实线上时，到目前为止的加注都是真实发生的；一旦偏离，分岔点的加注数就固定下来。
+    const pr = path >= 0 ? raises : pathRaises;
+    const maxR = budgetOf(pr);
     const mine = meActs ? sMe : sOpp;
     const theirs = meActs ? sOpp : sMe;
     const facing = theirs > mine;
@@ -331,14 +334,14 @@ function buildTree(inp: SolveInput): Tree {
     for (const a of acts) {
       if (a.type === "check") {
         // 引擎：本局已经有人行动过时，过牌即开牌。
-        self.kids.push(acted ? terminal(0, mine) : rec(sMe, sOpp, meActs ? 1 : 0, true, raises, oppRaised, next(onPath?.type === "check")));
+        self.kids.push(acted ? terminal(0, mine) : rec(sMe, sOpp, meActs ? 1 : 0, true, raises, oppRaised, next(onPath?.type === "check"), pr));
       } else if (a.type === "call") {
         const to = theirs;
         if (to >= M) self.kids.push(terminal(0, to));
         else {
           const nMe = meActs ? to : sMe;
           const nOpp = meActs ? sOpp : to;
-          self.kids.push(rec(nMe, nOpp, meActs ? 1 : 0, true, raises, oppRaised, next(onPath?.type === "call")));
+          self.kids.push(rec(nMe, nOpp, meActs ? 1 : 0, true, raises, oppRaised, next(onPath?.type === "call"), pr));
         }
       } else if (a.type === "fold") {
         self.kids.push(terminal(meActs ? 1 : 2, mine));
@@ -347,14 +350,14 @@ function buildTree(inp: SolveInput): Tree {
         const nMe = meActs ? to : sMe;
         const nOpp = meActs ? sOpp : to;
         self.kids.push(
-          rec(nMe, nOpp, meActs ? 1 : 0, true, raises + 1, oppRaised || !meActs, next(onPath?.type === "raise" && onPath.raiseTo === to))
+          rec(nMe, nOpp, meActs ? 1 : 0, true, raises + 1, oppRaised || !meActs, next(onPath?.type === "raise" && onPath.raiseTo === to), pr)
         );
       }
     }
     return idx;
   };
 
-  const root = rec(1, 1, inp.meFirst ? 0 : 1, false, 0, false, 0);
+  const root = rec(1, 1, inp.meFirst ? 0 : 1, false, 0, false, 0, 0);
 
   // 沿真实动作回放，找出「当前信息集」所在的节点。
   let cur = root;

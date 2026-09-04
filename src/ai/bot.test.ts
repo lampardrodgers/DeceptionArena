@@ -144,14 +144,16 @@ describe("betting", () => {
   });
 
   it("folds a marginal hand to an all-in when ahead, but takes it when short", () => {
-    // 10 对 UP1+DOWN1：约六成胜率。领先时不为整场赌六四开，落后到只剩 3 命时就得搏。
-    const ahead = setup({ ai: [10, 4], player: [12, 3], lives: 12 });
+    // J 对 UP1+DOWN1：对整条范围约七成胜率，但对方全下的范围偏重 UP，实际不到六成。
+    // 领先时不为整场赌这个胜率；落后到只剩 3 命时就得搏。
+    //（0.1.12：开司复制体按自己的效用（PARAMS.oppEdge）估值后全下范围更「实」，10 在 3 命时也弃了，这里改用 J。）
+    const ahead = setup({ ai: [11, 4], player: [12, 3], lives: 12 });
     selectCard(ahead, "player", ahead.players.player.hand[0].id);
     selectCard(ahead, "ai", ahead.players.ai.hand[0].id);
     act(ahead, "player", { type: "raise", raiseTo: 12 });
     expect(botBet(publicView(ahead), first).bet!.type).toBe("fold");
 
-    const short = setup({ ai: [10, 4], player: [12, 3], lives: 12 });
+    const short = setup({ ai: [11, 4], player: [12, 3], lives: 12 });
     short.players.ai.lives = 3;
     short.players.player.lives = 21;
     short.maxStake = 3;
@@ -300,9 +302,10 @@ describe("endgame and counting details", () => {
         prev = v;
       }
     }
-    // 命数越多剩下的局数越多，越值得靠每局的小优势磨：大局更谨慎。
-    expect(matchWinProb(60, 120)).toBeGreaterThan(PARAMS.matchEdge);
-    expect(matchWinProb(2, 4)).toBeLessThan(PARAMS.matchEdge);
+    // edgeScaling = 0：曲线形状与总命数无关，任何总量下双方持平都是 matchEdge
+    //（0.1.12 实测 1 会让 30 命的曲线弯到「全下要 99.6% 胜率」，被对面推光底注）。
+    expect(matchWinProb(60, 120)).toBeCloseTo(PARAMS.matchEdge, 9);
+    expect(matchWinProb(2, 4)).toBeCloseTo(PARAMS.matchEdge, 9);
   });
 
   it("counts a draw as half a win in the opponent's perceived strength", () => {
