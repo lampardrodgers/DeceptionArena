@@ -3,13 +3,17 @@ import { seededRng, type Card, type Rng } from "../game/cards.js";
 import { type BetAction, type BetInput, type GameState, type Lights, type RoundRecord, type Side, act, clearTable, legalBets, newGame, selectCard, startRound } from "../game/engine.js";
 import {
   type BotView,
+  type ConfSpot,
   MODEL_PARAMS,
   PARAMS,
   RANKS,
+  aggressionProb,
   analyze,
   botBet,
   botSelect,
   cmpRank,
+  contextConfidence,
+  foldProb,
   learnOpponent,
   matchWinProb,
   opponentConfidence,
@@ -317,9 +321,8 @@ function scriptedRounds(rounds: { rank: number; acts: Act[] }[], lives = 40, myL
   });
 }
 
-function scriptedView(rounds: { rank: number; acts: Act[] }[]): BotView {
-  const myLights: Lights = { up: 2, down: 0 };
-  const history = scriptedRounds(rounds);
+function scriptedView(rounds: { rank: number; acts: Act[] }[], myLights: Lights = { up: 2, down: 0 }): BotView {
+  const history = scriptedRounds(rounds, 40, myLights);
   return {
     round: rounds.length + 1,
     decks: 12,
@@ -476,6 +479,93 @@ describe("situational defence", () => {
     const view = spot(seen);
     expect(rate(learnOpponent(view).playDownWhenMixed.DOWN2)).toBeGreaterThan(0.6);
     expect(botBet(view, first).bet?.type).toBe("call");
+  });
+});
+
+describe("opponent modelling: price curve, MIX tells, situational confidence", () => {
+  const MIN_RAISE: Act[] = [["ai", "raise", 2], ["player", "call"]];
+  const MIN_RAISE_FOLD: Act[] = [["ai", "raise", 2], ["player", "fold"]];
+  const ALLIN_FOLD: Act[] = [["ai", "raise", 40], ["player", "fold"]];
+
+  it("learns a price-fold curve: calls small raises, folds to big ones", () => {
+    // 手工历史里双方 40 命 → 本局上限 M = 40：加到 2 落在小桶，加到 40 落在大桶。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 10; i += 1) {
+      rounds.push({ rank: 11, acts: MIN_RAISE }); // 小注必跟
+      rounds.push({ rank: 11, acts: ALLIN_FOLD }); // 大注必弃
+    }
+    const m = learnOpponent(scriptedView(rounds));
+    const q = 0.5; // 「mid」档，与手工历史里 J 的自认胜率一致
+    const small = foldProb(m, q, 2, 1, 40, 40);
+    const big = foldProb(m, q, 40, 1, 40, 40);
+    const pooled = foldProb(m, q, 2, 1, 40); // 不传 M：退回该档的全额度汇总（V1 行为）
+    // eslint-disable-next-line no-console
+    console.log(`price curve: small=${small.toFixed(3)} big=${big.toFixed(3)} pooled(no M)=${pooled.toFixed(3)}`);
+    expect(small).toBeLessThan(0.3);
+    expect(big).toBeGreaterThan(0.8);
+    // 汇总层混了两种价格，落在中间：只有分格才看得出这条曲线。
+    expect(pooled).toBeGreaterThan(small + 0.2);
+  });
+
+  it("keeps the price curve after the fast memory takes over", () => {
+    // 前 20 局面对最小加注就弃牌，后 10 局改成必跟：快记忆要能把小桶那一格翻过来。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 20; i += 1) rounds.push({ rank: 11, acts: MIN_RAISE_FOLD });
+    for (let i = 0; i < 10; i += 1) rounds.push({ rank: 11, acts: MIN_RAISE });
+    const m = learnOpponent(scriptedView(rounds));
+    const fused = foldProb(m, 0.5, 2, 1, 40, 40);
+    const slow = foldProb(m.slow, 0.5, 2, 1, 40, 40);
+    const fast = foldProb(m.fast, 0.5, 2, 1, 40, 40);
+    // eslint-disable-next-line no-console
+    console.log(`gear switch (small bucket): fast=${fast.toFixed(3)} slow=${slow.toFixed(3)} fused=${fused.toFixed(3)} wFast=${m.wFast.toFixed(2)}`);
+    expect(fast).toBeLessThan(slow);
+    expect(fused).toBeLessThan(slow);
+    expect(m.foldBySize.mid[0].n).toBeGreaterThan(5);
+  });
+
+  it("reads Kaiji's MIX choice and his raise as one joint tell", () => {
+    // 我方 DOWN2：他的 UP 牌必胜（vstrong），DOWN 牌里 7/6 也算强 —— 所以「打 DOWN 就加注」
+    // 的样本全落在 strong / vstrong 档，弱档本身没有任何直接数据。
+    const myLights: Lights = { up: 0, down: 2 };
+    const build = (n: number) => {
+      const rounds: { rank: number; acts: Act[] }[] = [];
+      for (let i = 0; i < 8; i += 1) rounds.push({ rank: 12, acts: CHECK_OPEN }); // 正常局：打 UP 牌、过牌
+      for (let i = 0; i < n; i += 1) rounds.push({ rank: i % 2 ? 7 : 6, acts: [["player", "raise", 2], ["ai", "call"]] });
+      return learnOpponent(scriptedView(rounds, myLights));
+    };
+    const curve: string[] = [];
+    let atFour = 0;
+    for (const n of [0, 1, 2, 4, 8]) {
+      const m = build(n);
+      const withCat = aggressionProb(m, "openFirst", 0.1, "DOWN", true);
+      const without = aggressionProb(m, "openFirst", 0.1);
+      curve.push(`n=${n}: withCat=${withCat.toFixed(3)} plain=${without.toFixed(3)}`);
+      if (n === 0) expect(withCat).toBeCloseTo(without, 9); // 没样本时联合项权重为 0，完全无损
+      if (n === 4) atFour = withCat;
+      if (n >= 2) expect(withCat).toBeGreaterThan(without + 0.15);
+    }
+    // eslint-disable-next-line no-console
+    console.log(`MIX joint tell (weak card, openFirst):\n  ${curve.join("\n  ")}`);
+    expect(atFour).toBeGreaterThanOrEqual(0.5);
+  });
+
+  it("scores confidence per situation, not globally", () => {
+    const facing: ConfSpot = { kaijiIsMix: true, facing: true, aggCtx: "openFirst", bucket: 2, bin: "mid" };
+    const opening: ConfSpot = { kaijiIsMix: true, facing: false, aggCtx: "openFirst", bucket: null, bin: "mid" };
+    const empty = learnOpponent(scriptedView([]));
+    expect(contextConfidence(empty, facing)).toBeCloseTo(MODEL_PARAMS.p0, 9);
+    expect(contextConfidence(empty, opening)).toBeCloseTo(MODEL_PARAMS.p0, 9);
+
+    // 20 局只有「先手开局」的样本：同一个模型在「面对全下」的局面上仍然什么都不知道。
+    const rounds: { rank: number; acts: Act[] }[] = [];
+    for (let i = 0; i < 20; i += 1) rounds.push({ rank: 11, acts: i % 2 ? RAISE_OPEN : CHECK_OPEN });
+    const m = learnOpponent(scriptedView(rounds));
+    const pOpen = contextConfidence(m, opening);
+    const pFacing = contextConfidence(m, facing);
+    // eslint-disable-next-line no-console
+    console.log(`context confidence: openFirst=${pOpen.toFixed(3)} facing-allin=${pFacing.toFixed(3)} global=${m.confidence.toFixed(3)}`);
+    expect(pFacing).toBeCloseTo(MODEL_PARAMS.p0, 9);
+    expect(pOpen).toBeGreaterThanOrEqual(0.5);
   });
 });
 

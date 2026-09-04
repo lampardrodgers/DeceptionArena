@@ -54,12 +54,23 @@ export interface Spot {
   val: (delta: number) => number;
   /** 顶层深度：顶层枚举全部加注额，更深的节点只看几个代表额。 */
   top: number;
+  /** 开司自己的指示灯是不是 UP1+DOWN1：是的话行为模型可以混入 MIX 联合统计。 */
+  oppMix?: boolean;
 }
 
-export function makeSpot(myRank: number, q: number[], model: OppModel, M: number, LOpp: number, val: (d: number) => number, top: number): Spot {
+export function makeSpot(
+  myRank: number,
+  q: number[],
+  model: OppModel,
+  M: number,
+  LOpp: number,
+  val: (d: number) => number,
+  top: number,
+  oppMix = false
+): Spot {
   const o = zeros();
   for (const c of RANKS) o[c] = cmpRank(myRank, c);
-  return { o, q, model, M, LOpp, val, top };
+  return { o, q, model, M, LOpp, val, top, oppMix };
 }
 
 export function outcomes(D: number[], o: number[]): { win: number; lose: number; draw: number } {
@@ -133,8 +144,8 @@ export function hisResponse(D: number[], spot: Spot, R: number, sOpp: number, de
   const pf = zeros();
   const prr = zeros();
   for (const c of RANKS) {
-    pf[c] = foldProb(model, q[c], R, sOpp, LOpp);
-    prr[c] = R < M && depth >= 0 ? (1 - pf[c]) * reraiseProb(model, q[c]) : 0;
+    pf[c] = foldProb(model, q[c], R, sOpp, LOpp, M, catOfRank(c), spot.oppMix);
+    prr[c] = R < M && depth >= 0 ? (1 - pf[c]) * reraiseProb(model, q[c], M, R, sOpp) : 0;
   }
   let ev = 0;
   let fold = 0;
@@ -192,7 +203,7 @@ export function hisTurn(D: number[], spot: Spot, S: number, depth: number, mode:
   const { q, model, M } = spot;
   if (S >= M || depth < 0) return showdown(D, spot, S);
   const pr = zeros();
-  for (const c of RANKS) pr[c] = aggressionProb(model, mode, q[c]);
+  for (const c of RANKS) pr[c] = aggressionProb(model, mode, q[c], catOfRank(c), spot.oppMix);
   let ev = 0;
   for (const br of hisRaiseBranches(spot, S, depth)) {
     const raise = condition(D, (c) => pr[c] * br.w(c));
