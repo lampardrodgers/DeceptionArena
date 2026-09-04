@@ -189,6 +189,19 @@ export function historyPools(view: BotView): number[][] {
   return out;
 }
 
+/** 把「我的牌对上各点数的结果」（o：+1 胜 / −1 负 / 0 平）按分布 D 汇总成三个概率。 */
+export function outcomes(D: number[], o: number[]): { win: number; lose: number; draw: number } {
+  let win = 0;
+  let lose = 0;
+  let draw = 0;
+  for (const c of RANKS) {
+    if (o[c] > 0) win += D[c];
+    else if (o[c] < 0) lose += D[c];
+    else draw += D[c];
+  }
+  return { win, lose, draw };
+}
+
 export function normalize(d: number[]): number[] {
   let s = 0;
   for (const v of d) s += v;
@@ -487,4 +500,16 @@ function matchWinProbEdge(L: number, T: number, edge: number): number {
 /** `u` 的可调风险态度版本：命数变化 delta 带来的效用变化，曲率由 `edge` 决定。 */
 export function uWithEdge(delta: number, LMe: number, T: number, edge: number = PARAMS.solveEdge): number {
   return matchWinProbEdge(LMe + delta, T, edge) - matchWinProbEdge(LMe, T, edge);
+}
+
+/**
+ * 求解器里开司复制体**自己**的效用曲线（一般和求解，参数是他本局的命数变化）：
+ * `PARAMS.oppEdge > 0` 时按他的命数与该风险态度取凹曲线；0 则返回 undefined，求解器退回严格零和。
+ * 为什么默认一般和：严格零和把他建成「自知劣势、爱好波动」的复制体，均衡里他每手全下、我方每手弃牌，
+ * v0.1.12 开发期实测 H2H 对 v0.1.10 快照从 65% 跌到 35%。真实对手（和旧机器人）都是各自厌恶风险的。
+ */
+export function oppVal(LOpp: number, T: number): ((dOpp: number) => number) | undefined {
+  const edge = PARAMS.oppEdge;
+  if (!(edge > 0)) return undefined;
+  return (dOpp) => uWithEdge(dOpp, LOpp, T, edge);
 }

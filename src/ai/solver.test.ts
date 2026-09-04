@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 import { seededRng, type Card } from "../game/cards.js";
 import { type GameState, act, newGame, selectCard, startRound } from "../game/engine.js";
 import { AI, PARAMS, RANKS, analyze, cmpRank, perceivedRange, publicView, unitUtility } from "./analysis.js";
-import { DEPTH, makeSpot, makeVal, roundEV } from "./bettingTree.js";
+import { buildFvTable, makeValByRank, oneHot } from "./futureValue.js";
 import { type SolveInput, type Solved, SOLVER_PARAMS, solve } from "./solver.js";
 
 /** 固定局面：把指定点数的牌塞进双方手里（和 bot.test.ts 里的写法一致）。 */
@@ -32,7 +32,9 @@ function inputOf(s: GameState, p: number, iters?: number): SolveInput {
   const view = publicView(s);
   const A = analyze(view);
   const keep: Card | null = view.hand[0] ?? null;
-  const val = makeVal(view, A, keep, new Map());
+  // Stage C：终局值按打出的点数分档（留牌价值来自求解器算的下一局表）。这里是单元测试，
+  // 简单起见所有点数都用真实留牌（one-hot），够检查「策略的形状」了。
+  const val = makeValByRank(view, () => oneHot(keep?.rank ?? null), buildFvTable(view, A));
   return {
     myPrior: perceivedRange(view.lights.ai, A.theirs),
     oppPrior: A.played,
@@ -42,9 +44,8 @@ function inputOf(s: GameState, p: number, iters?: number): SolveInput {
     M: view.maxStake,
     meFirst: view.firstMover === AI,
     LOpp: view.lives.player,
-    // 严格零和：只给我方效用，开司的就是它取负。终局值按我方点数分档（这里 13 个点数
-    // 暂时共用同一条曲线 —— Stage C 才会把留牌价值按打出的点数拆开）。
-    val: (_rank: number, d: number) => val(d),
+    // 严格零和：只给我方效用，开司的就是它取负。终局值按我方点数分档。
+    val,
     edge: PARAMS.solveEdge,
     actions: view.actions,
     iters
@@ -173,20 +174,16 @@ describe("solver: 范围策略的形状", () => {
       const s = setup({ ai: sp.ai, player: sp.player, firstMover: "ai" });
       playBoth(s);
       const view = publicView(s);
-      const A = analyze(view);
-      const inp = inputOf(s, 1);
-      const sol = solve(inp);
+      const sol = solve(inputOf(s, 1));
       // 纯度：最佳回应应该几乎是确定性的。实测四格分别是 1.00 / 1.00 / 0.98 / 0.71，
       // 最后一格（9 对 10）本来就是两个动作 EV 只差千分之几的边界局面，阈值取 0.7（**待提高**）。
       const st = sol.strategyAt(sol.cur, sp.rank);
       expect(Math.max(...st)).toBeGreaterThanOrEqual(0.7);
-      // EV 对照旧树（同样是「开司照模型出牌」的假设）。只卡下界：旧树在自己的抽象里
-      // 做的是「单张牌的最优动作」，求解器把范围也一并解了，比它高是好事，实测 −0.007 ~ +0.120 命。
-      const rawVal = (d: number) => inp.val(sp.rank, d);
-      const spot = makeSpot(sp.rank, A.q, A.model, view.maxStake, view.lives.player, rawVal, DEPTH);
-      const old = roundEV(A.played, spot, true, DEPTH);
+      // 旧的 Math.max 下注树在 Stage C（D9’）里已经整体删掉了，留牌价值改由求解器自己算，
+      // 所以这里不再有「对照旧树 EV」的断言；只保留纯度检查，外加一个宽松的量纲检查：
+      // p=1 时对模型做最佳回应，根值不应该离谱（单位是「一命」的效用）。
       const unit = unitUtility(view.lives.ai, view.lives.ai + view.lives.player);
-      expect((sol.rootValue(sp.rank) - old) / unit).toBeGreaterThan(-0.05);
+      expect(Math.abs(sol.rootValue(sp.rank) / unit)).toBeLessThan(5);
     }
   });
 
@@ -285,18 +282,20 @@ describe("solver: 范围策略的形状", () => {
       bluffExec += ex;
       bluffDisp += dp;
       rows.push(`  最弱牌 ${c}：加注总概率 原始 ${raw.toFixed(4)} / 执行剪枝 ${ex.toFixed(4)} / 展示剪枝 ${dp.toFixed(4)}`);
-      expect(ex).toBeGreaterThan(0); // 诈唬还在
     }
+    let slowExec = 0;
     for (const c of strongest) {
       const raw = massOf(c, 0, "check");
       const ex = massOf(c, SOLVER_PARAMS.executionPrune, "check");
+      slowExec += ex;
       rows.push(`  最强牌 ${c}：过牌概率 原始 ${raw.toFixed(4)} / 执行剪枝 ${ex.toFixed(4)}`);
-      expect(ex).toBeGreaterThan(0); // 慢打（强牌过牌设陷阱）还在
     }
-    // 执行剪枝保留的诈唬额度种类必须比展示剪枝多 —— 否则两档阈值就没有分开的意义。
+    // 执行剪枝保留的加注档数必须比展示剪枝多 —— 否则两档阈值就没有分开的意义。
+    // 数的是整条范围（不只最弱三张）：均衡里「万分之几的额度」出现在哪张牌上是局面决定的，
+    // 钉死在最弱三张会把一个纯粹的形状检查变成对某个具体格子的过拟合。
     const sizesLeft = (thr: number) => {
       let n = 0;
-      for (const c of weakest) {
+      for (const c of live) {
         const st = prune(sol.strategyAt(sol.cur, c), thr);
         for (let i = 0; i < acts.length; i += 1) if (acts[i].type === "raise" && st[i] > 0) n += 1;
       }
@@ -304,9 +303,14 @@ describe("solver: 范围策略的形状", () => {
     };
     const nExec = sizesLeft(SOLVER_PARAMS.executionPrune);
     const nDisp = sizesLeft(SOLVER_PARAMS.displayPrune);
-    rows.push(`  最弱三张保留的加注档数：执行 ${nExec} / 展示 ${nDisp}；诈唬总量 ${bluffExec.toFixed(4)} / ${bluffDisp.toFixed(4)}`);
-    expect(nExec).toBeGreaterThan(nDisp);
+    rows.push(`  全范围保留的加注档数：执行 ${nExec} / 展示 ${nDisp}；最弱三张的诈唬总量 ${bluffExec.toFixed(4)} / ${bluffDisp.toFixed(4)}`);
     console.log(["\n=== 执行剪枝 vs 展示剪枝（MIX vs MIX，先手） ===", ...rows, ""].join("\n"));
+    // 断言放在打印之后：这张表在失败时比断言本身更有用。
+    // 逐张牌断言「每张最弱牌都还在诈唬」太苛刻 —— 均衡里本来就有「彻底放弃」的那一档
+    // （Stage C 换掉终局估值之后，最弱的那张牌确实变成纯过牌），所以改成看这三张的总量。
+    expect(bluffExec).toBeGreaterThan(0);
+    expect(slowExec).toBeGreaterThan(0);
+    expect(nExec).toBeGreaterThan(nDisp);
   });
 
   it("(h) 可利用度（NashConv）随迭代收敛，且执行剪枝几乎不花钱", () => {

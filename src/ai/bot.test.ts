@@ -622,6 +622,9 @@ describe("simulation", () => {
       // eslint-disable-next-line no-console
       console.log(`bot vs ${strategy.name}: ${r.wins}/${GAMES} (${Math.round(rate * 100)}%), avg ${Math.round(r.rounds / GAMES)} rounds/game`);
       expect(rate).toBeGreaterThanOrEqual(minRate);
-    }, 120000);
+      // 阶段 C 之后一次决策要跑「留牌估值表 18 次求解 + 选牌固定点 6 轮」，
+      // 单局成本从几毫秒涨到 200ms 量级，60 局一场的对局模拟因此需要几分钟。
+      // 这是明知的取舍（换来的是选牌不再是 softmax 拍脑袋），超时随之抬高。
+    }, 900000);
   }
 });

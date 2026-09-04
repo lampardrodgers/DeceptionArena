@@ -4,37 +4,49 @@
  * 只使用公开信息决策：自己的手牌、双方指示灯、本局下注过程、历史开牌记录、
  * 弃牌堆（所有打出的牌都翻开过）、牌堆重洗的时刻。绝不读取开司的手牌、牌堆顺序或被切掉的牌。
  *
- * 决策分三层，分别在三个模块里：
+ * 决策分四块：
  *  1. 记牌 + 读牌：`analysis.ts`。当前牌靴减去已翻开的牌和自己的牌 = 未知牌池；
  *     对开司「留在手里那张牌」做贝叶斯滤波，再结合本局下注行为修正他打出的牌的分布。
  *  2. 对手建模：`opponentModel.ts`。选牌偏好与下注偏好全部从对局历史中统计
  *     （带先验、随时间衰减的 Beta / Dirichlet 计数），越打越了解对手。
  *  3. 算账：`solver.ts`。在本局的下注子博弈上跑 CFR+ / Restricted Nash Response，
  *     解出的是**整条范围的混合策略**而不是单张牌的最优动作，所以同一个额度里既有价值牌也有诈唬牌。
- *     `bettingTree.ts` 退居二线，只负责终局估值（`makeVal`：把命数变化折成「赢下整场的概率」，
- *     并计入留牌对下一局的增益），所以领先时不为微小优势梭哈、落后时敢搏。
+ *     `futureValue.ts` 负责终局估值：把命数变化折成「赢下整场的概率」，并按**打出的点数**分档
+ *     计入留牌对下一局的增益（下一局同样用求解器估，不再是最佳回应的上界）。
+ *  4. 选牌与下注是**同一个策略的两半**（D3）：`selectionPolicy` 从开司视角枚举所有与我方指示灯
+ *     一致的两牌组合，用 regret matching 迭代出「打哪一张」的混合策略，求解器用的 `myPrior`
+ *     正是它聚合出来的；`botSelect` 从它抽样，`botBet` 复用同一份先验。这样开司眼中我方的范围
+ *     和我方真实的选牌频率是自洽的 —— 求解器里的诈唬组合在现实中真的会出现。
+ *
+ * RNR 里「照模型打」的权重 `p` 由 `confidenceFor` 按**当前情境**给出（D6）：
+ * 只数当前信息集真正会查到的那几格样本，没见过的局面自动退回接近均衡的打法。
  *
  * 本文件只保留决策入口（选牌 / 下注）、台词与人类可读的推理文本，并 re-export 全部公开 API。
  */
 import { type Card, cardLabel, RANK_LABEL, type Rng } from "../game/cards.js";
-import { type BetInput, type Lights } from "../game/engine.js";
+import { type BetInput, type Lights, type Side } from "../game/engine.js";
 import {
   type Analysis,
   type BotView,
+  type Ctx,
   AI,
+  HUMAN,
   PARAMS,
   RANKS,
   analyze,
+  catOfRank,
   cmpRank,
-  perceivedRange,
+  ctxOf,
+  normalize,
+  outcomes,
+  oppVal,
   uWithEdge,
   unitUtility,
   unknownPool,
-  u,
   zeros
 } from "./analysis.js";
-import { type Beta, type Bin5, type OppModel, rate } from "./opponentModel.js";
-import { type FutureCache, makeVal, outcomes } from "./bettingTree.js";
+import { type AggCtx, type Beta, type Bin5, type OppModel, aggCtxOf, contextConfidence, rate } from "./opponentModel.js";
+import { type FvTable, buildFvTable, makeValByRank, oneHot } from "./futureValue.js";
 import { type SolveInput, type Solved, type SolvedAction, SOLVER_PARAMS, solve } from "./solver.js";
 
 // 兼容旧的 import 路径：外部代码只从 ./bot.js 取这些 API。
@@ -68,11 +80,8 @@ export {
 export type { AggCtx, Beta, Bin, Bin5, BySize, ConfSpot, OppModel, OppStats, SizeBucket } from "./opponentModel.js";
 export { SOLVER_PARAMS, solve } from "./solver.js";
 export type { SolveInput, Solved, SolvedAction } from "./solver.js";
-
-/** 动作选择的 softmax 温度（单位：命，按当前效用斜率换算）。 */
-const TEMP = 0.2;
-/** 只在与最优动作 EV 相差不超过此值（单位：命）的动作之间随机。 */
-const MIX_MARGIN = 0.35;
+export { FV_ITERS, GAMMA, buildFvTable, makeValByRank } from "./futureValue.js";
+export type { FvTable } from "./futureValue.js";
 
 // ---------- 台词 ----------
 
@@ -170,19 +179,269 @@ function handText(view: BotView, A: Analysis): string {
   return `【开司手牌】灯 ${lightsText(L)}：${heldNote}。本局出牌分布：${distText(A.played)}。`;
 }
 
-/** 带温度的随机选择：只在接近最优的几个候选之间抽。unit = 1 命对应的效用。 */
-function softmaxPick<T extends { ev: number }>(cands: T[], rng: Rng, unit: number, temp = TEMP, margin = MIX_MARGIN, keep = 4): T {
-  const sorted = cands.slice().sort((a, b) => b.ev - a.ev);
-  const best = sorted[0].ev;
-  const near = sorted.filter((c) => c.ev >= best - margin * unit).slice(0, keep);
-  const weights = near.map((c) => Math.exp((c.ev - best) / (temp * unit)));
-  const total = weights.reduce((s, w) => s + w, 0);
-  let x = rng() * total;
-  for (let i = 0; i < near.length; i += 1) {
-    x -= weights[i];
-    if (x <= 0) return near[i];
+// ---------- 情境置信度（D6） ----------
+
+/**
+ * RNR 权重 `p`：开司照对手模型出牌的概率。
+ *
+ * 旧实现直接取全局的 `model.confidence`，于是「先手开局加注」的 30 个样本会被算进
+ * 「面对全下要不要跟」的自信里 —— 在一个从没见过的局面上照样敢按模型剥削。
+ * 这里改成按**当前信息集下开司最近的那个决策**去数样本（`contextConfidence`）：
+ *   - 开司先手且本局尚无动作 → 他马上要做的就是 `openFirst`；
+ *   - 我先手且我尚未行动 → 他要么在我过牌后偷注，要么面对我的加注，两者各半；
+ *   - 我正面对他的加注 → 他接下来只会在「面对我的再加注」那几格里出现。
+ * 胜率档 `bin` 传 null：他的点数在我们眼里是一整条分布（`A.q` 覆盖多个档），不该只数一格。
+ *
+ * 除了「他下一步」，还要数**他本局已经做过的那几个决策**：求解器是从本局开局重放到当前节点的，
+ * 他此刻手里这条范围完全是那些动作筛出来的。只看「下一步」会漏掉最重要的一类读牌 ——
+ * 他先手开火时我永远没有「他面对我再加注」的样本，于是 p 永远钉在 p0，
+ * 哪怕我已经看了他八局用垃圾牌最小加注，求解器读到的仍是一条均衡的（很强的）加注范围。
+ * 两半各占一半：过去那几格解释「他为什么会在这里」，未来那格解释「我打下去他会怎么应」。
+ */
+export function confidenceFor(view: BotView, A: Analysis): number {
+  const kaijiIsMix = ctxOf(view.lights.player) === "MIX";
+  const cc = (facing: boolean, aggCtx: AggCtx) =>
+    contextConfidence(A.model, { kaijiIsMix, facing, aggCtx, bucket: null, bin: null });
+
+  // (1) 他接下来那个决策落在哪几格。
+  let next: number;
+  if (view.stakes.player > view.stakes.ai) {
+    // 我在面对加注：他下一次决策是「面对我的再加注」，查的是 fold / reraise 那几格。
+    next = cc(true, "barrel");
+  } else if (view.actions.length === 0) {
+    next = view.firstMover !== AI ? cc(false, "openFirst") : 0.5 * cc(false, "stabAfterBotCheck") + 0.5 * cc(true, "stabAfterBotCheck");
+  } else {
+    const heRaised = view.actions.some((a) => a.side !== AI && a.type === "raise");
+    const agg: AggCtx = heRaised ? "barrel" : "stabAfterBotCheck";
+    next = 0.5 * cc(false, agg) + 0.5 * cc(true, agg);
   }
-  return near[near.length - 1];
+
+  // (2) 他本局已经做过的决策各自落在哪几格（重放方式与 opponentModel 的学习端一致）。
+  const past: number[] = [];
+  const st: Record<Side, number> = { player: 1, ai: 1 };
+  let heRaisedBefore = false;
+  view.actions.forEach((a, idx) => {
+    if (a.side !== AI) {
+      past.push(cc(st[AI] > st[a.side], aggCtxOf(idx === 0, heRaisedBefore)));
+      if (a.type === "raise") heRaisedBefore = true;
+    }
+    if (a.type === "raise") st[a.side] = a.raiseTo ?? st[a.side];
+    else if (a.type === "call") st[a.side] = st[a.side === AI ? HUMAN : AI];
+  });
+  if (past.length === 0) return next;
+  return 0.5 * next + 0.5 * (past.reduce((x, y) => x + y, 0) / past.length);
+}
+
+// ---------- 每局一次的缓存：留牌价值表 + 选牌策略 ----------
+
+/**
+ * 留牌价值表和选牌策略都只依赖「本局开打时的公开信息」（牌池、指示灯、命数、历史），
+ * 与我方手里具体是哪两张牌、本局已经下了什么注都无关，所以 `botSelect` 和 `botBet` 共用一份。
+ * 键里带上牌池是必须的：同一局号、同一命数下不同的牌池是完全不同的局面（测试里尤其常见）。
+ */
+interface RoundCache {
+  key: string;
+  fv: FvTable;
+  policy: SelectionPolicy | null;
+}
+let roundCache: RoundCache | null = null;
+
+function roundKey(view: BotView, A: Analysis): string {
+  return [
+    view.round,
+    view.lives.ai,
+    view.lives.player,
+    view.maxStake,
+    view.firstMover,
+    view.lights.ai.up,
+    view.lights.player.up,
+    view.history.length,
+    PARAMS.solveEdge,
+    A.pool.join(",")
+  ].join("|");
+}
+
+function cacheOf(view: BotView, A: Analysis): RoundCache {
+  const key = roundKey(view, A);
+  if (roundCache && roundCache.key === key) return roundCache;
+  roundCache = { key, fv: buildFvTable(view, A), policy: null };
+  return roundCache;
+}
+
+// ---------- 选牌—下注固定点（D3） ----------
+
+/** 迭代次数。每轮一次求解 + 13 次 `evaluate`；实测 6 轮就足以让 σ 稳定到千分位。 */
+const SELECT_ITERS = 6;
+/** 每一对的两个选择都至少保留这个概率：完全确定化的选牌等于把手牌摊开给对手看。 */
+const SELECT_FLOOR = 0.02;
+
+/** 组合的键：MIX 时 a 是 UP 那张，否则 a 是点数较小的那张（与 `pairsOf` 一致）。 */
+export const pairKey = (a: number, b: number) => a * 16 + b;
+
+export interface SelectionPolicy {
+  /** 与我方指示灯一致的两牌组合（开司视角），w = 该组合的先验权重。 */
+  pairs: { a: number; b: number; w: number }[];
+  /** pairKey → P(打出 a)。 */
+  sigma: Map<number, number>;
+  /** pairKey → 两个选择各自的效用（最后一轮）。 */
+  evPairs: Map<number, { evA: number; evB: number }>;
+  /** σ 聚合出来的「开司眼中我打出的牌」的分布。 */
+  myPrior: number[];
+  /** 打出 rank 时留在手里的牌的条件分布。 */
+  keptGiven: (rank: number) => number[];
+  /** 最后一轮的求解结果（供展示 / 复用）。 */
+  sol: Solved;
+  fv: FvTable;
+}
+
+/** 与指示灯一致的两牌组合：UP2 → 两张都 ≥8；DOWN2 → 两张都 <8；MIX → 一 UP 一 DOWN。 */
+function pairsOf(ctx: Ctx, theirs: number[]): { a: number; b: number; w: number }[] {
+  const UP = RANKS.filter((r) => catOfRank(r) === "UP");
+  const DOWN = RANKS.filter((r) => catOfRank(r) === "DOWN");
+  const out: { a: number; b: number; w: number }[] = [];
+  if (ctx === "MIX") {
+    for (const a of UP) for (const b of DOWN) if (theirs[a] > 0 && theirs[b] > 0) out.push({ a, b, w: theirs[a] * theirs[b] });
+  } else {
+    const S = ctx === "UP2" ? UP : DOWN;
+    for (let i = 0; i < S.length; i += 1) {
+      for (let j = i; j < S.length; j += 1) {
+        const a = S[i];
+        const b = S[j];
+        const w = a === b ? theirs[a] * (theirs[a] - 1) : theirs[a] * theirs[b];
+        if (w > 0) out.push({ a, b, w });
+      }
+    }
+  }
+  const total = out.reduce((s, x) => s + x.w, 0);
+  if (total > 0) for (const x of out) x.w /= total;
+  return out;
+}
+
+/** 两个动作的 regret matching+ 状态。 */
+interface PairState {
+  ra: number;
+  rb: number;
+  /** 平均策略的分子 / 分母（含一份权重为 1 的 0.5 伪计数，见下）。 */
+  sum: number;
+  wSum: number;
+  /** 本轮策略。 */
+  sigma: number;
+  /** 到目前为止的平均策略 —— 聚合 `myPrior` 用的是它，不是本轮策略。 */
+  avg: number;
+}
+
+/**
+ * 选牌—下注固定点。
+ *
+ * 「打哪一张」和「怎么下注」互相依赖：下注策略要知道开司眼中我方范围的形状，而这条范围
+ * 完全由选牌频率决定；反过来选牌的收益又要靠下注子博弈才算得出来。旧实现把两者割裂 ——
+ * `myPrior` 用的是「按指示灯的 UP/DOWN 比例 + 牌池」这条与真实选牌无关的分布，
+ * 于是求解器里出现的诈唬组合在现实中根本不会发生。
+ *
+ * 这里迭代到自洽：给一组选牌频率 σ → 聚合出 `myPrior` 与「打 r 留 k」的条件分布 → 解一次
+ * 下注子博弈 → 用 13 次 `evaluate`（同一套策略、只换终局估值）读出「打 r 留 k」的价值 →
+ * regret matching+ 更新 σ。返回的是平均策略（带 2% 下限，保留一点混淆）。
+ */
+export function selectionPolicy(view: BotView, A: Analysis, fv: FvTable, iters = SELECT_ITERS): SelectionPolicy {
+  const ctx = ctxOf(view.lights.ai);
+  const pairs = pairsOf(ctx, A.theirs);
+  const st = new Map<number, PairState>();
+  // 伪计数 (0.5, 权重 1)：第一轮的 `myPrior` 就是「两张牌各半」（也就是旧版按指示灯 + 牌池的先验），
+  // 之后每轮往里掺入新的策略，避免第一轮的极端最佳回应直接把范围甩到 97% 打 UP 上。
+  for (const p of pairs) st.set(pairKey(p.a, p.b), { ra: 0, rb: 0, sum: 0.5, wSum: 1, sigma: 0.5, avg: 0.5 });
+  const poolFallback = normalize(A.pool.slice());
+
+  let myPrior = zeros();
+  let keptTable: number[][] = [];
+  let sol!: Solved;
+  const evPairs = new Map<number, { evA: number; evB: number }>();
+
+  /** 由 σ 聚合出 `myPrior` 与 keptGiven。 */
+  const aggregate = (): void => {
+    const my = zeros();
+    const kept: number[][] = RANKS.map(() => zeros());
+    const idx = new Map<number, number>();
+    RANKS.forEach((r, i) => idx.set(r, i));
+    for (const p of pairs) {
+      const s = st.get(pairKey(p.a, p.b))!.avg;
+      my[p.a] += p.w * s;
+      my[p.b] += p.w * (1 - s);
+      kept[idx.get(p.a)!][p.b] += p.w * s;
+      kept[idx.get(p.b)!][p.a] += p.w * (1 - s);
+    }
+    myPrior = normalize(my);
+    keptTable = kept.map((row) => {
+      const sum = row.reduce((x, y) => x + y, 0);
+      return sum > 0 ? row.map((v) => v / sum) : poolFallback.slice();
+    });
+  };
+  const keptGiven = (rank: number): number[] => keptTable[RANKS.indexOf(rank)] ?? poolFallback;
+
+  const base = {
+    oppPrior: A.played,
+    q: A.q,
+    model: A.model,
+    p: confidenceFor(view, A),
+    M: view.maxStake,
+    meFirst: view.firstMover === AI,
+    LOpp: view.lives.player,
+    oppMix: ctxOf(view.lights.player) === "MIX",
+    valOpp: oppVal(view.lives.player, view.lives.ai + view.lives.player),
+    edge: PARAMS.solveEdge,
+    // 选牌时本局还没有任何下注动作，树从根开始。
+    actions: []
+  };
+
+  for (let t = 1; t <= iters; t += 1) {
+    aggregate();
+    sol = solve({ ...base, myPrior, val: makeValByRank(view, keptGiven, fv) } as SolveInput);
+    // 「打 r 留 k」的价值：同一套策略换一套终局估值再走一遍，13 个点数一次出。
+    const held = new Map<number, (rank: number) => number>();
+    for (const k of RANKS) if (A.theirs[k] > 0) held.set(k, sol.evaluate(makeValByRank(view, () => oneHot(k), fv)));
+    const fallback = (rank: number) => sol.rootValue(rank);
+    for (const p of pairs) {
+      const key = pairKey(p.a, p.b);
+      const s = st.get(key)!;
+      const evA = (held.get(p.b) ?? fallback)(p.a);
+      const evB = (held.get(p.a) ?? fallback)(p.b);
+      evPairs.set(key, { evA, evB });
+      const cur = s.sigma * evA + (1 - s.sigma) * evB;
+      // Linear CFR：第 t 轮的即时遗憾乘 t；平均策略按 t² 加权（与 solver.ts 同一套加权）。
+      s.ra = Math.max(0, s.ra + (evA - cur) * t);
+      s.rb = Math.max(0, s.rb + (evB - cur) * t);
+      const tot = s.ra + s.rb;
+      s.sigma = tot > 0 ? s.ra / tot : 0.5;
+      // 先更新再累加：这样最后一轮改进过的策略也进得了平均，而第一轮那个「面对 50/50 范围」
+      // 的最佳回应只以 1/91 的权重出现。虚拟对局对的是**平均策略**（`avg`），迭代之间不会来回甩。
+      s.sum += t * t * s.sigma;
+      s.wSum += t * t;
+      s.avg = s.sum / s.wSum;
+    }
+  }
+  // 平均策略 + 2% 下限。
+  const sigma = new Map<number, number>();
+  for (const p of pairs) {
+    const key = pairKey(p.a, p.b);
+    const s = st.get(key)!;
+    const avg = s.avg;
+    const lo = Math.max(avg, SELECT_FLOOR);
+    const hi = Math.max(1 - avg, SELECT_FLOOR);
+    sigma.set(key, lo / (lo + hi));
+    s.sigma = sigma.get(key)!;
+    s.avg = s.sigma;
+  }
+  // 用最终的（带下限的）σ 再聚合一次，让 `myPrior` / `keptGiven` 与 `sigma` 严格自洽。
+  // 返回的 `sol` 仍是最后一轮那次求解（它用的是加下限之前的 `myPrior`）：下限只挪动千分位，
+  // 而 `botBet` 本来就会带着本局真实动作重解一次，这里的 `sol` 只用于展示与选牌时的 EV 拆分。
+  aggregate();
+  return { pairs, sigma, evPairs, myPrior, keptGiven, sol, fv };
+}
+
+/** 取（或算）本局的选牌策略。`botSelect` 与 `botBet` 拿到的是同一个对象（每局一份缓存）。 */
+export function policyOf(view: BotView, A: Analysis): SelectionPolicy {
+  const c = cacheOf(view, A);
+  if (!c.policy) c.policy = selectionPolicy(view, A, c.fv);
+  return c.policy;
 }
 
 // ---------- 求解器接口 ----------
@@ -190,49 +449,26 @@ function softmaxPick<T extends { ev: number }>(cands: T[], rng: Rng, unit: numbe
 /**
  * 组装一次求解的输入。
  *
- * `myPrior` 是**开司眼中我打出的那张牌**的分布：按我方指示灯的 UP/DOWN 比例加权，
- * 类内再按他看得到的牌池分配（和 `perceivedWin` 用的是同一套视角）。这是求解器与旧下注树
- * 最本质的区别 —— 旧树只问「我这张牌该怎么打」，求解器解的是「我这条范围整体该怎么打」。
- *
- * RNR 权重 `p` 直接取对手模型的置信度：越了解对手越敢按模型剥削，样本不足时退回纳什。
+ * `myPrior` 来自选牌策略（D3）：开司眼中我打出的那张牌的分布，就是我方真实选牌频率的聚合，
+ * 两者自洽。`val` 按打出的点数分档（D9'）：开司看不到我留了什么，他眼中每个点数背后都是
+ * 一整条留牌分布，13 个点数的终局值因此不同。
  */
-function solveInput(view: BotView, A: Analysis, val: (d: number) => number): SolveInput {
-  const LMe = view.lives.ai;
-  const LOpp = view.lives.player;
+function solveInput(view: BotView, A: Analysis, pol: SelectionPolicy, keptGiven: (rank: number) => number[]): SolveInput {
   return {
-    myPrior: perceivedRange(view.lights.ai, A.theirs),
+    myPrior: pol.myPrior,
     oppPrior: A.played,
     q: A.q,
     model: A.model,
-    p: A.model.confidence,
+    p: confidenceFor(view, A),
     M: view.maxStake,
     meFirst: view.firstMover === AI,
-    LOpp,
-    // 求解器现在是严格零和（开司效用 = −我方效用），风险态度由求解专用的 `PARAMS.solveEdge` 给：
-    // 把 `makeVal` 里的本局效用项换成 solveEdge 版本，留牌的下一局增益仍沿用 matchEdge
-    //（Stage C 会把它一并改成按点数分档的范围估值，那时 `val` 的第一个参数才真正用起来）。
-    val: solveVal(val, LMe, LMe + LOpp),
-    valOpp: oppVal(LOpp, LMe + LOpp),
+    LOpp: view.lives.player,
+    oppMix: ctxOf(view.lights.player) === "MIX",
+    val: makeValByRank(view, keptGiven, pol.fv),
+    valOpp: oppVal(view.lives.player, view.lives.ai + view.lives.player),
     edge: PARAMS.solveEdge,
     actions: view.actions
   };
-}
-
-/**
- * 开司复制体自己的效用曲线（一般和求解）：`PARAMS.oppEdge > 0` 时按他的命数与该风险态度取凹曲线，
- * 0 则回到严格零和（返回 undefined）。
- */
-function oppVal(LOpp: number, T: number): ((dOpp: number) => number) | undefined {
-  const edge = PARAMS.oppEdge;
-  if (!(edge > 0)) return undefined;
-  return (dOpp) => uWithEdge(dOpp, LOpp, T, edge);
-}
-
-/** 把「本局命数变化 → 效用」的曲率从 matchEdge 换成 solveEdge；两者相等时是逐位的恒等变换。 */
-function solveVal(val: (d: number) => number, LMe: number, T: number): (rank: number, d: number) => number {
-  const edge = PARAMS.solveEdge;
-  if (edge === PARAMS.matchEdge) return (_rank, d) => val(d);
-  return (_rank, d) => val(d) - u(d, LMe, T) + uWithEdge(d, LMe, T, edge);
 }
 
 /**
@@ -242,26 +478,19 @@ function solveVal(val: (d: number) => number, LMe: number, T: number): (rank: nu
 let memoKey = "";
 let memoSol: Solved | null = null;
 
-function solveRound(tag: string, view: BotView, A: Analysis, val: (d: number) => number): Solved {
+function solveRound(view: BotView, A: Analysis, pol: SelectionPolicy, keptGiven: (rank: number) => number[]): Solved {
   const acts = view.actions.map((a) => `${a.side[0]}${a.type[0]}${a.raiseTo ?? ""}`).join("");
   const key = [
-    tag,
-    view.round,
-    view.lives.ai,
-    view.lives.player,
+    roundKey(view, A),
     view.stakes.ai,
     view.stakes.player,
-    view.maxStake,
     view.chosen?.rank ?? 0,
-    // 留在手里的牌决定终局估值（下一局增益），必须进键：否则新一局若开局签名相同会拿到上一局的解。
+    // 留在手里的牌决定终局估值（下一局增益），必须进键。
     view.hand.map((c) => c.rank).join(","),
-    view.lights.ai.up,
-    view.lights.player.up,
-    view.history.length,
     acts
   ].join("|");
   if (key === memoKey && memoSol) return memoSol;
-  memoSol = solve(solveInput(view, A, val));
+  memoSol = solve(solveInput(view, A, pol, keptGiven));
   memoKey = key;
   return memoSol;
 }
@@ -285,6 +514,22 @@ function stratText(sol: Solved, n: number, rank: number, M: number, max = 3): st
     .slice(0, max)
     .map((x) => `${actLabel(x.a, M)} ${pct(x.p)}`);
   return items.join("/") || "—";
+}
+
+/**
+ * 某个点数在节点 n 上**执行时真正会用**的完整混合（不做展示剪枝，只滤掉执行剪枝那 0.5%）。
+ * 展示剪枝 2% 会把低频诈唬和慢打整条藏起来，看着像「加注 = 强牌」；这一行专门让人看见它们。
+ */
+function fullMixText(sol: Solved, n: number, rank: number, M: number): string {
+  const acts = sol.actionsOf(n);
+  const st = sol.strategyAt(n, rank);
+  const kept = acts.map((a, i) => ({ a, p: st[i] })).filter((x) => x.p >= SOLVER_PARAMS.executionPrune);
+  const total = kept.reduce((s, x) => s + x.p, 0);
+  if (!(total > 0)) return "—";
+  return kept
+    .sort((x, y) => y.p - x.p)
+    .map((x) => `${actLabel(x.a, M)} ${(100 * (x.p / total)).toFixed(1)}%`)
+    .join(" / ");
 }
 
 /**
@@ -321,38 +566,96 @@ export function botSelect(view: BotView, rng: Rng = Math.random): BotDecision {
   const LOpp = view.lives.player;
   const T = LMe + LOpp;
   const unit = unitUtility(LMe, T);
+  const pol = policyOf(view, A);
+  const sol = pol.sol;
+  // 与求解用的 `val` 同一条曲线（solveEdge），这样「合计 − 本局 = 留牌增益」才是同一把尺子。
+  const valNow = (_rank: number, d: number) => uWithEdge(d, LMe, T, PARAMS.solveEdge);
+  const evNowOf = sol.evaluate(valNow);
+
+  // 我手里这两张对应的组合，方向与 `pairsOf` 一致：MIX 时 a 是 UP 那张，否则 a 是点数较小的那张。
+  const mix = ctxOf(view.lights.ai) === "MIX";
+  const [ca, cb] = mix
+    ? catOfRank(hand[0].rank) === "UP"
+      ? [hand[0], hand[1]]
+      : [hand[1], hand[0]]
+    : hand[0].rank <= hand[1].rank
+      ? [hand[0], hand[1]]
+      : [hand[1], hand[0]];
+  const pA = pol.sigma.get(pairKey(ca.rank, cb.rank)) ?? 0.5;
+
   const lines: string[] = [
     modelText(A.model),
     poolText(view, A),
     handText(view, A),
-    `【我方候选】先手：${iAmFirst ? "我" : "开司"}，本局上限 ${M} 命（EV 以命计，已按整场胜率折算；留牌增益按本局各种结局分别估算，输光则没有下一局）。`
+    `【我方候选】先手：${iAmFirst ? "我" : "开司"}，本局上限 ${M} 命（EV 以命计，已按整场胜率折算；留牌价值由下一局的范围求解器估算，输光则没有下一局）。`
   ];
-  // 两张候选各求解一次：留牌的下一局价值会改变终局估值，进而改变整条范围的打法，
-  // 所以不能「解一次再补一项」。`FutureCache` 在两次之间共享，重算的只是 CFR 迭代本身。
-  const cache: FutureCache = new Map();
-  // 与求解用的 `val` 同一条曲线（solveEdge），这样「合计 − 本局 = 留牌增益」才是同一把尺子。
-  const valNow = (_rank: number, d: number) => uWithEdge(d, LMe, T, PARAMS.solveEdge);
-  const cands = hand.map((card, i) => {
-    const keep = hand[1 - i];
-    const sol = solveRound(`sel${i}`, view, A, makeVal(view, A, keep, cache));
-    const ev = sol.rootValue(card.rank);
-    // 同一套策略换一套终局估值再走一遍，就能把「留牌增益」单独摘出来给人看。
-    const evNow = sol.evaluate(valNow)(card.rank);
+  const cands = [
+    { card: ca, keep: cb, p: pA },
+    { card: cb, keep: ca, p: 1 - pA }
+  ].map(({ card, keep, p }) => {
+    // 同一套策略换两套终局估值各走一遍，就能把「本局」和「留牌增益」分开给人看。
+    const ev = sol.evaluate(makeValByRank(view, () => oneHot(keep.rank), pol.fv))(card.rank);
+    const evNow = evNowOf(card.rank);
     const o = zeros();
     for (const c of RANKS) o[c] = cmpRank(card.rank, c);
     const oc = outcomes(A.played, o);
     lines.push(
-      `${cardLabel(card)}：本局胜 ${pct(oc.win)} / 平 ${pct(oc.draw)} / 负 ${pct(oc.lose)} → 本局 EV ${inLives(evNow, unit)} 命；留 ${cardLabel(keep)} 对下一局的增益 ${inLives(ev - evNow, unit)} → 合计 ${inLives(ev, unit)}；范围策略下我打 ${cardLabel(card)} 的开局动作：${stratText(sol, sol.cur, card.rank, M)}`
+      `${cardLabel(card)}：本局胜 ${pct(oc.win)} / 平 ${pct(oc.draw)} / 负 ${pct(oc.lose)} → 本局 EV ${inLives(evNow, unit)} 命；留 ${cardLabel(keep)} 对下一局的增益 ${inLives(ev - evNow, unit)} → 合计 ${inLives(ev, unit)}；打出它的概率 ${pct(p)}；范围策略下的开局动作：${stratText(sol, sol.cur, card.rank, M)}`
     );
-    return { card, keep, ev, win: oc.win, sol };
+    return { card, keep, p };
   });
-  const pick = softmaxPick(cands, rng, unit, TEMP, 0.25, 2);
-  lines.push(
-    `【范围策略】开司照模型出牌的权重 p=${pct(A.model.confidence)}（剩下的按纳什求解）；树 ${pick.sol.nodeCount} 节点 × ${pick.sol.iters} 次 CFR+ 迭代。`,
-    `【决定】打出 ${cardLabel(pick.card)}，留 ${cardLabel(pick.keep)}。`
-  );
+
+  // 按 σ 抽样：只消耗一次 rng，且按概率从大到小排序，`rng = () => 0` 就是「取最可能的那张」。
+  const order = cands.slice().sort((x, y) => y.p - x.p);
+  let r = rng();
+  let pick = order[order.length - 1];
+  for (const c of order) {
+    r -= c.p;
+    if (r <= 0) {
+      pick = c;
+      break;
+    }
+  }
+
+  lines.push(rangeViewText(A, pol), decisionText(view, A, pol, sol));
+  lines.push(`【决定】打出 ${cardLabel(pick.card)}，留 ${cardLabel(pick.keep)}（该选择的概率 ${pct(pick.p)}）。`);
   const say = pickLine(LINES.select, rng);
   return { kind: "select", cardId: pick.card.id, say, reasoning: lines.join("\n") };
+}
+
+/** 思考面板里「开司眼中我方选牌范围长什么样」的一行。 */
+function rangeViewText(A: Analysis, pol: SelectionPolicy): string {
+  let up = 0;
+  for (const r of RANKS) if (catOfRank(r) === "UP") up += pol.myPrior[r];
+  // 「诈唬组合」= 打出那张对上他的出牌分布胜率更低的牌，按组合权重 × 打出它的概率排序。
+  const winOf = (rank: number) => {
+    const o = zeros();
+    for (const c of RANKS) o[c] = cmpRank(rank, c);
+    const oc = outcomes(A.played, o);
+    return oc.win + oc.draw / 2;
+  };
+  const bluffs = pol.pairs
+    .map((p) => {
+      const s = pol.sigma.get(pairKey(p.a, p.b)) ?? 0.5;
+      const aWeak = winOf(p.a) <= winOf(p.b);
+      const weak = aWeak ? p.a : p.b;
+      const strong = aWeak ? p.b : p.a;
+      const prob = aWeak ? s : 1 - s;
+      return { weak, strong, score: p.w * prob, prob };
+    })
+    .sort((x, y) => y.score - x.score)
+    .slice(0, 3)
+    .map((x) => `${RANK_LABEL[x.weak]}（留 ${RANK_LABEL[x.strong]}）${pct(x.prob)}`)
+    .join(" · ");
+  return `【范围视角】开司眼中我打 UP 牌的概率 ${pct(up)}；我方出牌分布 ${distText(pol.myPrior)}。最可能的诈唬组合：${bluffs || "（无）"}。`;
+}
+
+/** 思考面板里「这次求解用了什么参数」的一行。 */
+function decisionText(view: BotView, A: Analysis, pol: SelectionPolicy, sol: Solved): string {
+  return (
+    `【范围策略】开司照模型出牌的权重 p=${pct(confidenceFor(view, A))}（本情境；全局可信度 ${pct(A.model.confidence)}）；` +
+    `树 ${sol.nodeCount} 节点 × ${sol.iters} 次 CFR+ 迭代；选牌固定点迭代 ${SELECT_ITERS} 轮 × ${pol.pairs.length} 个组合，留牌估值表 ${pol.fv.solves} 次求解。`
+  );
 }
 
 export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
@@ -371,7 +674,13 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
   const oc = outcomes(D, o);
   const opening = view.actions.length === 0;
 
-  const sol = solveRound("bet", view, A, makeVal(view, A, keep, new Map()));
+  const pol = policyOf(view, A);
+  // 终局估值按打出的点数分档：范围里**其它**点数用选牌策略聚合出来的留牌分布（开司只能知道这个），
+  // 唯独我自己实际打出的这个点数换成真实留牌（one-hot）—— 这是有意的不对称：
+  // 我知道自己留了什么，他不知道；他眼中我这个点数背后仍然是一整条留牌分布，
+  // 所以他的策略（也就是树里他那一侧）完全没有因此被喂进任何私有信息。
+  const keptGiven = (rank: number) => (rank === mine.rank ? oneHot(keep?.rank ?? null) : pol.keptGiven(rank));
+  const sol = solveRound(view, A, pol, keptGiven);
   // 求解器的动作集来自引擎的状态机，正常情况下和 `legal` 完全一致；
   // 这里再筛一道纯属兜底 —— 机器人绝不能返回非法动作。
   const isLegal = (a: SolvedAction) =>
@@ -438,8 +747,9 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
     poolText(view, A),
     handText(view, A),
     `【开司出牌分布】按其本局下注修正后：${distText(D)}。我方胜 ${pct(oc.win)} / 平 ${pct(oc.draw)} / 负 ${pct(oc.lose)}。`,
-    `【范围策略】开司照模型出牌的权重 p=${pct(A.model.confidence)}（剩下的按纳什求解）；树 ${sol.nodeCount} 节点 × ${sol.iters} 次 CFR+ 迭代。`,
+    decisionText(view, A, pol, sol),
     `　我方 ${cardLabel(mine)} 的动作分布：${stratText(sol, sol.cur, mine.rank, M, 4)}。范围里其他点数：${byRange || "—"}。`,
+    `　本手牌的完整混合：${sol.kindOf(sol.cur) === 0 ? fullMixText(sol, sol.cur, mine.rank, M) : "—"}（执行剪枝 ${(100 * SOLVER_PARAMS.executionPrune).toFixed(1)}%；上面一行按展示剪枝 ${(100 * SOLVER_PARAMS.displayPrune).toFixed(0)}% 只列前几项）。`,
     `【动作评估】（含后续加注 / 再加注的推演）${actionText}。`,
     `【开司眼中我方范围】本动作前：${distText(range)}${chosen ? `；打出「${actLabel(acts[chosen.pick], M)}」之后：${distText(sol.rangeAfter(sol.cur, chosen.pick))}` : ""}。`,
     `【决定】${chosen ? actLabel(acts[chosen.pick], M) : "（兜底）"}${chosen ? `（该动作在范围策略里的概率 ${pct(chosen.probs.get(chosen.pick) ?? 1)}）` : ""}。`
