@@ -21,11 +21,20 @@
  * 的 EV 只差千分之几时，等权平均要上千次迭代才能把前几轮的探索噪声稀释掉，实测「必胜牌该加多大」
  * 这类局面 200 次就选错额度；加权之后同样 200 次就稳定选中最优额度，耗时不变。
  *
- * 注意：**这里刻意不是严格零和**。若令「开司效用 = −我方效用」，那么在 `matchEdge = 0.9` 之下
- * 开司就成了自知只有 10% 胜算的绝对劣势方 —— 他的效用曲线是凸的、极度爱好波动，最优策略退化成
- * 「每手全下」，而我方要跟一个 12 命的全下需要 83% 的胜率、于是「每手弃牌」。这个均衡在数学上没错，
- * 但它只是把 `matchEdge` 这条启发式当成了开司的真实认知。所以求解器给双方各自的风险厌恶效用
- * （`val` / `valOpp`，都以「我的命数变化」为自变量），两人都不愿意为 1 命的底池赌上整场。
+ * **严格零和**（v0.1.12 起）：开司的效用就是 `−val(rank, delta)`，不再有独立的 `valOpp`。
+ * 之前给双方各配一条凹效用曲线（两人都不愿为 1 命的底池赌上整场）看着更「像人」，代价是：
+ *   1. 那个博弈根本没有零和结构，`p = 0` 解出来的东西**不是纳什均衡**，也就谈不上「不可被反读」——
+ *      而这正是引入求解器的全部理由；
+ *   2. 可利用度无从定义，更无从测量。零和之后 `exploitability()`（见下）才有意义：
+ *      NashConv = 双方各自最佳回应能多赚的效用之和，`p = 0` 时它就是标准可利用度。
+ * 至于当初的顾虑 —— 令开司效用 = −我方效用时，`matchEdge = 0.9` 会让他成为自知只有 10% 胜算的
+ * 绝对劣势方，效用曲线凸、极度爱好波动、最优策略退化成「每手全下」，逼得我方每手弃牌 ——
+ * 那是**风险态度参数取值**的问题，不是零和结构的问题：现在由 `PARAMS.solveEdge`（求解专用，
+ * 与展示 / 选牌用的 `PARAMS.matchEdge` 分家）单独控制曲率，调用方组装 `val` 时用它。
+ * 默认两者都是 0.9，真正的取值由 Stage B 扫参决定（预期 0.65–0.8）。
+ *
+ * 终局值还按**我方打出的点数**分档（`val(rank, delta)`）：13 个点数共用一条 `val(delta)` 时，
+ * 留在手里那张牌的下一局价值会被错配到所有点数上。
  */
 import { type BetAction, type BetActionType } from "../game/engine.js";
 import {
@@ -49,10 +58,20 @@ const toIdx = (rank: number) => rank - 2;
 export const SOLVER_PARAMS = {
   /** CFR+ 迭代次数。 */
   iters: 200,
-  /** 双方合计的加注次数上限，超过之后只剩 fold / call / check。 */
+  /**
+   * 双方合计的加注次数上限的**下限**，超过之后只剩 fold / call / check。
+   * 实际上限 = max(这个值, 本局真实历史里已经发生的加注次数 + 2)：现实已经打到第 4 次加注时，
+   * 树里必须还留得下「再加一次、对方再加一次」，否则当前信息集就成了强制的 call/fold 二选一。
+   */
   maxRaises: 3,
-  /** 输出策略时低于这个概率的动作直接剔除（去噪，避免万分之一概率的怪动作）。 */
-  prune: 0.03
+  /**
+   * **执行**剪枝：`pickAction` 抽样前先把低于这个概率的动作归零再归一化。
+   * 取值很小是刻意的 —— 旧的 3% 会把低频诈唬 / 慢打整条删掉，策略于是重新可读（真人几局就能看穿）。
+   * 0.5% 只滤掉「万分之几的数值噪声」，实测对可利用度的影响 < 0.01 命（见 solver.test.ts (g)）。
+   */
+  executionPrune: 0.005,
+  /** **展示**剪枝：思考面板上不列出低于这个概率的动作。只影响人看到什么，不影响机器人怎么打。 */
+  displayPrune: 0.02
 };
 
 export interface SolvedAction {
@@ -79,13 +98,34 @@ export interface SolveInput {
   meFirst: boolean;
   /** 开司的命数（影响他对加注额的敏感度）。 */
   LOpp: number;
-  /** 终局估值：本局我的命数变化 → 我方效用（已含留牌的下一局价值）。 */
-  val: (delta: number) => number;
-  /** 终局估值：同样以「我的命数变化」为自变量，返回开司的效用（他赢就是我输，所以是递减的）。 */
-  valOpp: (deltaMe: number) => number;
+  /**
+   * 终局估值：我方打出点数 `rank`（2..14）、本局我的命数变化 `delta` 时**我方**的效用
+   * （已含留在手里那张牌的下一局价值 —— 它会随打出的点数而变，所以要按 rank 分档）。
+   * 开司的效用严格是 `−val(rank, delta)`，求解器不再接受第二条曲线。
+   */
+  val: (rank: number, delta: number) => number;
+  /**
+   * 组装 `val` 时用的风险态度（`PARAMS.solveEdge`）。求解器自己不算效用，这项纯粹是透传，
+   * 方便调用方 / 展示层知道这次解是在哪条曲线下算出来的。
+   */
+  edge?: number;
   /** 本局已发生的动作。真实额度会并入抽象，保证现实这条线上的押注额精确。 */
   actions: BetAction[];
   iters?: number;
+}
+
+/** `exploitability()` 的结果，单位是效用；除以 `unitUtility` 换算成命。 */
+export interface Exploitability {
+  /** 我方对「固定的开司策略」的最佳回应值。 */
+  brMe: number;
+  /** 开司对「固定的我方策略」的最佳回应值（自由复制体那一份最大化，模型复制体照旧）。 */
+  brOpp: number;
+  /** 当前策略组合下我方的期望效用。 */
+  valueMe: number;
+  /** 当前策略组合下开司的期望效用（严格零和，= −valueMe）。 */
+  valueOpp: number;
+  /** NashConv = (brMe − valueMe) + (brOpp − valueOpp)：双方各自还能多榨出多少。 */
+  nashConv: number;
 }
 
 export interface Solved {
@@ -105,7 +145,20 @@ export interface Solved {
   /** 我方各点数在根节点的期望效用。 */
   rootValue(rank: number): number;
   /** 换一套终局估值重新求期望（策略不变）：用于「同一次求解、两张候选留牌」。 */
-  evaluate(val2: (d: number) => number): (rank: number) => number;
+  evaluate(val2: (rank: number, delta: number) => number): (rank: number) => number;
+  /**
+   * 平均策略的可利用度（NashConv）。`p = 0` 时它就是标准可利用度：双方都在同一棵树上
+   * 对对方的平均策略做最佳回应，两边的增益之和为 0 才是纳什均衡。
+   * `p > 0` 时开司是「p 概率照模型出牌 + (1−p) 自由复制体」的混合体，最大化的只有自由那一份，
+   * 于是这个数衡量的是「RNR 意义下的可利用度」，跨 p 之间不可比。
+   */
+  exploitability(): Exploitability;
+  /**
+   * 同上，但先把**我方**平均策略里低于 `pruneBelow` 的动作归零再归一化 —— 也就是
+   * `pickAction` 真正执行的那套策略（开司那边不剪：他不受我们的执行剪枝约束）。
+   * 用来回答「执行剪枝到底送掉了多少可利用度」。
+   */
+  exploitabilityOf(pruneBelow: number): Exploitability;
   /** 在节点 n 打出第 a 个动作之后，开司眼中我方的点数分布（长度 15，按点数下标）。 */
   rangeAfter(n: number, a: number): number[];
   /** 节点 n 处开司眼中我方的范围（未按动作细分）。 */
@@ -118,8 +171,12 @@ export interface Solved {
 
 /**
  * 我方的加注额抽象。
- * 首次加注按方案枚举六个代表额（空间 ≤ 6 命时干脆全枚举）；再往深处只留「最小 / 全下」两档
- * —— 树规模是 (我方档数 × 开司档数)^深度，深层不收敛的话 200 次 CFR 迭代跑不进 30 ms。
+ * 首次加注按方案枚举六个代表额（空间 ≤ 6 命时干脆全枚举）；再往深处留「最小 / 中码 / 全下」三档。
+ *
+ * 中码取 `round((from+1+M)/2)`，即「最小加注与全下的中点」。只有 {min, all-in} 的时候，
+ * 再加注这一步是个二值信号：小的一定是诈唬 / 薄价值，大的一定是坚果 —— 既读得穿，也没法
+ * 「小注 → 中注 → 收割」地逐步诱导对手把命喂进来。树规模是 (我方档数 × 开司档数)^深度，
+ * 所以只在这里加一档、且不再细分（实测节点数与耗时见 solver.test.ts (f)）。
  */
 export function mySizes(from: number, M: number, raises: number): number[] {
   if (from >= M) return [];
@@ -127,6 +184,7 @@ export function mySizes(from: number, M: number, raises: number): number[] {
   const out = new Set<number>();
   if (raises > 0) {
     out.add(from + 1);
+    out.add(Math.round((from + 1 + M) / 2));
     out.add(M);
   } else if (span <= 6) {
     for (let R = from + 1; R <= M; R += 1) out.add(R);
@@ -185,7 +243,11 @@ interface Tree {
 
 function buildTree(inp: SolveInput): Tree {
   const { M, actions } = inp;
-  const maxR = SOLVER_PARAMS.maxRaises;
+  // 加注次数上限按真实历史抬高：现实已经打到第 k 次加注了，树里还得留得下「我再加一次、
+  // 他再加一次」，否则当前信息集会被抽象逼成 call/fold 二选一，深层的再加注威胁全部消失。
+  let histRaises = 0;
+  for (const a of actions) if (a.type === "raise") histRaises += 1;
+  const maxR = Math.max(SOLVER_PARAMS.maxRaises, histRaises + 2);
   const nodes: Node[] = [];
   let stratSize = 0;
 
@@ -391,14 +453,17 @@ export function solve(inp: SolveInput): Solved {
   const rF = new Float64Array(NB * N);
   const vMe = new Float64Array(NB * N);
   const vOpp = new Float64Array(NB * N);
-  const tW = new Float64Array(NB);
-  const tD = new Float64Array(NB);
-  const tL = new Float64Array(NB);
-  const oW = new Float64Array(NB);
-  const oD = new Float64Array(NB);
-  const oL = new Float64Array(NB);
+  // 终局值按「节点 × 我方点数」两维存：留牌的下一局价值随打出的点数而变。
+  const tW = new Float64Array(NB * N);
+  const tD = new Float64Array(NB * N);
+  const tL = new Float64Array(NB * N);
   const combo = new Float64Array(N);
   const tmp = new Float64Array(N);
+  const gW = new Float64Array(N);
+  const gD = new Float64Array(N);
+  const gL = new Float64Array(N);
+  const sufW = new Float64Array(N);
+  const preL = new Float64Array(N);
 
   // 根部到达概率：我方 = 开司眼中我打出的牌的先验；开司 = 选牌先验，按 p 拆成模型 / 自由两个复制体。
   const rb = root * N;
@@ -420,22 +485,74 @@ export function solve(inp: SolveInput): Solved {
   rootMy.set(rMe.subarray(rb, rb + N));
   const rootFree = new Float64Array(N);
   rootFree.set(rF.subarray(rb, rb + N));
+  /** 归一化后的开司出牌先验（还没按 p 拆成两个复制体）。 */
+  const rootOpp = new Float64Array(N);
+  for (let i = 0; i < N; i += 1) rootOpp[i] = rM[rb + i] + rF[rb + i];
 
-  /** 把终局估值写进 W/D/L 三个数组（W = 我赢、D = 平、L = 我输）。 */
-  function prepareTerminals(valFn: (d: number) => number, W: Float64Array, D: Float64Array, L: Float64Array): void {
+  /**
+   * 把终局估值写进 W/D/L 三个数组（W = 我赢、D = 平、L = 我输），每个数组 NB × N：
+   * 同一个终局节点在不同的「我方打出点数」下值不一样（留牌的下一局价值不同）。
+   */
+  function prepareTerminals(valFn: (rank: number, d: number) => number, W: Float64Array, D: Float64Array, L: Float64Array): void {
     for (let n = 0; n < NB; n += 1) {
       const nd = nodes[n];
       if (nd.kind !== 2) continue;
+      const b = n * N;
       if (nd.term === 0) {
-        W[n] = valFn(nd.stake);
-        D[n] = valFn(0);
-        L[n] = valFn(-nd.stake);
+        for (let i = 0; i < N; i += 1) {
+          W[b + i] = valFn(i + 2, nd.stake);
+          D[b + i] = valFn(i + 2, 0);
+          L[b + i] = valFn(i + 2, -nd.stake);
+        }
       } else {
-        const v = valFn(nd.term === 1 ? -nd.stake : nd.stake);
-        W[n] = v;
-        D[n] = v;
-        L[n] = v;
+        const d = nd.term === 1 ? -nd.stake : nd.stake;
+        for (let i = 0; i < N; i += 1) {
+          const v = valFn(i + 2, d);
+          W[b + i] = v;
+          D[b + i] = v;
+          L[b + i] = v;
+        }
       }
+    }
+  }
+
+  /**
+   * 终局上开司拿点数 c 时的反事实值。严格零和：他的效用 = −（我方效用），于是
+   *   vOpp(c) = −Σ_i reach(i) · val_i(我方在 (i, c) 这一对上的结局)。
+   * 效用现在按我方点数 i 分档，不能像以前那样只对 reach 做前缀和；改成对
+   * 「我赢 / 平 / 我输」三条**已经乘好 val_i** 的序列各做一次按 i 的前缀和，仍是 O(N)。
+   * 顺序就是点数序，唯一例外是 2 克 A（下标 0 克下标 12）。
+   */
+  function termOpp(n: number, reach: Float64Array, out: Float64Array): void {
+    const b = n * N;
+    for (let i = 0; i < N; i += 1) {
+      const r = reach[b + i];
+      gW[i] = r * tW[b + i];
+      gD[i] = r * tD[b + i];
+      gL[i] = r * tL[b + i];
+    }
+    let accW = 0;
+    for (let i = N - 1; i >= 0; i -= 1) {
+      accW += gW[i];
+      sufW[i] = accW; // sufW[i] = Σ_{j ≥ i} gW[j]
+    }
+    let accL = 0;
+    for (let c = 0; c < N; c += 1) {
+      preL[c] = accL; // preL[c] = Σ_{j < c} gL[j]
+      accL += gL[c];
+    }
+    for (let c = 0; c < N; c += 1) {
+      let win = c + 1 < N ? sufW[c + 1] : 0; // 点数比 c 大的我方牌赢
+      let lose = preL[c]; // 点数比 c 小的我方牌输
+      if (c === N - 1) {
+        win += gW[0]; // 2 克 A
+        lose -= gL[0];
+      }
+      if (c === 0) {
+        win -= gW[N - 1]; // A 打不过 2
+        lose += gL[N - 1];
+      }
+      out[b + c] = -(win + gD[c] + lose);
     }
   }
 
@@ -445,27 +562,16 @@ export function solve(inp: SolveInput): Solved {
    */
   function fillTerminal(n: number, wantMe: boolean): void {
     const b = n * N;
-    if (wantMe) {
-      for (let i = 0; i < N; i += 1) combo[i] = rM[b + i] + rF[b + i];
-      const w = tW[n];
-      const d = tD[n];
-      const l = tL[n];
-      const totalOpp = beatMass(combo, 0, tmp);
-      for (let i = 0; i < N; i += 1) {
-        const win = tmp[i];
-        const draw = combo[i];
-        vMe[b + i] = win * w + draw * d + (totalOpp - win - draw) * l;
-      }
+    if (!wantMe) {
+      termOpp(n, rMe, vOpp);
       return;
     }
-    const ow = oW[n];
-    const od = oD[n];
-    const ol = oL[n];
-    const totalMe = beatMass(rMe, b, tmp);
-    for (let c = 0; c < N; c += 1) {
-      const lose = tmp[c]; // 我方被 c 打赢的质量
-      const draw = rMe[b + c];
-      vOpp[b + c] = (totalMe - lose - draw) * ow + draw * od + lose * ol;
+    for (let i = 0; i < N; i += 1) combo[i] = rM[b + i] + rF[b + i];
+    const totalOpp = beatMass(combo, 0, tmp);
+    for (let i = 0; i < N; i += 1) {
+      const win = tmp[i];
+      const draw = combo[i];
+      vMe[b + i] = win * tW[b + i] + draw * tD[b + i] + (totalOpp - win - draw) * tL[b + i];
     }
   }
 
@@ -549,7 +655,6 @@ export function solve(inp: SolveInput): Solved {
   }
 
   prepareTerminals(inp.val, tW, tD, tL);
-  prepareTerminals(inp.valOpp, oW, oD, oL);
   let wMe = 0;
   let wOpp = 0;
   for (let t = 1; t <= iters; t += 1) {
@@ -653,6 +758,172 @@ export function solve(inp: SolveInput): Solved {
     oppReach[n] = s;
   }
 
+  // ---------- 可利用度（NashConv） ----------
+
+  /**
+   * 把我方平均策略里低于阈值的动作归零再归一化 —— 也就是 `pickAction` 真正会执行的那套。
+   * 一个信息集上所有动作都被剪光时保留原策略（和 `pickAction` 的兜底一致）。
+   */
+  function prunedMine(thr: number): Float64Array {
+    const out = new Float64Array(avg);
+    if (!(thr > 0)) return out;
+    for (const nd of nodes) {
+      if (nd.kind !== 0) continue;
+      const A = nd.nA;
+      for (let i = 0; i < N; i += 1) {
+        const base = nd.off + i * A;
+        let s = 0;
+        for (let a = 0; a < A; a += 1) if (out[base + a] >= thr) s += out[base + a];
+        if (!(s > 0)) continue;
+        for (let a = 0; a < A; a += 1) out[base + a] = out[base + a] >= thr ? out[base + a] / s : 0;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * 在同一棵树上算 NashConv。两遍独立的遍历，各用自己的到达概率数组（不碰求解时的 rMe/rM/rF）：
+   *   第一遍：开司策略固定（模型复制体照 `modelStrat`，自由复制体照 `avg`），我方节点分别取
+   *     max（最佳回应 → brMe）与按 `myStrat` 加权（当前值 → valueMe）。
+   *   第二遍：我方策略固定成 `myStrat`，开司节点分别按 `modelStrat`（模型那份，两边共用）、
+   *     `avg`（自由那份的当前值 → valueOpp）、max（自由那份的最佳回应 → brOpp）。
+   * 两遍的 valueMe / valueOpp 用的是同一个策略组合，零和之下应当互为相反数（测试里会核对），
+   * 而且 max ≥ 加权平均，所以两个增益都保证非负。
+   */
+  function exploitWith(myStrat: Float64Array): Exploitability {
+    prepareTerminals(inp.val, tW, tD, tL); // `evaluate()` 可能改写过终局值，先还原
+    const xMe = new Float64Array(NB * N);
+    const xM = new Float64Array(NB * N);
+    const xF = new Float64Array(NB * N);
+    const vBR = new Float64Array(NB * N);
+    const vCur = new Float64Array(NB * N);
+    const oM = new Float64Array(NB * N);
+    const oA = new Float64Array(NB * N);
+    const oF = new Float64Array(NB * N);
+    const cb = new Float64Array(N);
+    const t2 = new Float64Array(N);
+
+    const downMe = (n: number): void => {
+      const nd = nodes[n];
+      const b = n * N;
+      if (nd.kind === 2) {
+        for (let i = 0; i < N; i += 1) cb[i] = xM[b + i] + xF[b + i];
+        const tot = beatMass(cb, 0, t2);
+        for (let i = 0; i < N; i += 1) {
+          const win = t2[i];
+          const draw = cb[i];
+          const v = win * tW[b + i] + draw * tD[b + i] + (tot - win - draw) * tL[b + i];
+          vBR[b + i] = v;
+          vCur[b + i] = v;
+        }
+        return;
+      }
+      const A = nd.nA;
+      const off = nd.off;
+      const me = nd.kind === 0;
+      for (let a = 0; a < A; a += 1) {
+        const kb = nd.kids[a] * N;
+        for (let i = 0; i < N; i += 1) {
+          if (me) {
+            xM[kb + i] = xM[b + i];
+            xF[kb + i] = xF[b + i];
+          } else {
+            xM[kb + i] = xM[b + i] * modelStrat[off + i * A + a];
+            xF[kb + i] = xF[b + i] * avg[off + i * A + a];
+          }
+        }
+        downMe(nd.kids[a]);
+      }
+      for (let i = 0; i < N; i += 1) {
+        const base = off + i * A;
+        let best = -Infinity;
+        let sum = 0;
+        let cur = 0;
+        for (let a = 0; a < A; a += 1) {
+          const kb = nd.kids[a] * N + i;
+          const bv = vBR[kb];
+          if (bv > best) best = bv;
+          sum += bv;
+          cur += me ? myStrat[base + a] * vCur[kb] : vCur[kb];
+        }
+        // 开司节点：他的动作概率已经乘进 xM/xF 了，所以两边都只是求和。
+        vBR[b + i] = me ? best : sum;
+        vCur[b + i] = cur;
+      }
+    };
+
+    const downOpp = (n: number): void => {
+      const nd = nodes[n];
+      const b = n * N;
+      if (nd.kind === 2) {
+        termOpp(n, xMe, oM);
+        for (let c = 0; c < N; c += 1) {
+          oA[b + c] = oM[b + c];
+          oF[b + c] = oM[b + c];
+        }
+        return;
+      }
+      const A = nd.nA;
+      const off = nd.off;
+      const me = nd.kind === 0;
+      for (let a = 0; a < A; a += 1) {
+        const kb = nd.kids[a] * N;
+        for (let i = 0; i < N; i += 1) xMe[kb + i] = me ? xMe[b + i] * myStrat[off + i * A + a] : xMe[b + i];
+        downOpp(nd.kids[a]);
+      }
+      for (let c = 0; c < N; c += 1) {
+        const base = off + c * A;
+        let m = 0;
+        let av = 0;
+        let best = -Infinity;
+        let sum = 0;
+        for (let a = 0; a < A; a += 1) {
+          const kb = nd.kids[a] * N + c;
+          if (me) {
+            m += oM[kb];
+            av += oA[kb];
+          } else {
+            m += modelStrat[base + a] * oM[kb];
+            av += avg[base + a] * oA[kb];
+          }
+          const fv = oF[kb];
+          if (fv > best) best = fv;
+          sum += fv;
+        }
+        oM[b + c] = m;
+        oA[b + c] = av;
+        // 我方节点：我的动作概率已经乘进 xMe 了，求和；开司节点：自由复制体挑最大。
+        oF[b + c] = me ? sum : best;
+      }
+    };
+
+    for (let i = 0; i < N; i += 1) {
+      xM[rb + i] = rootOpp[i] * p;
+      xF[rb + i] = rootOpp[i] * (1 - p);
+    }
+    downMe(root);
+    let brMe = 0;
+    let valueMe = 0;
+    for (let i = 0; i < N; i += 1) {
+      brMe += rootMy[i] * vBR[rb + i];
+      valueMe += rootMy[i] * vCur[rb + i];
+    }
+
+    for (let i = 0; i < N; i += 1) xMe[rb + i] = rootMy[i];
+    downOpp(root);
+    let vm = 0;
+    let va = 0;
+    let vf = 0;
+    for (let c = 0; c < N; c += 1) {
+      vm += rootOpp[c] * oM[rb + c];
+      va += rootOpp[c] * oA[rb + c];
+      vf += rootOpp[c] * oF[rb + c];
+    }
+    const valueOpp = p * vm + (1 - p) * va;
+    const brOpp = p * vm + (1 - p) * vf;
+    return { brMe, brOpp, valueMe, valueOpp, nashConv: brMe - valueMe + (brOpp - valueOpp) };
+  }
+
   const rangeOf = (n: number, weightAction: number): number[] => {
     const nd = nodes[n];
     const out = new Array<number>(15).fill(0);
@@ -692,6 +963,8 @@ export function solve(inp: SolveInput): Solved {
       out.set(vMe.subarray(rb, rb + N));
       return (rank: number) => out[toIdx(rank)];
     },
+    exploitability: () => exploitWith(avg),
+    exploitabilityOf: (pruneBelow) => exploitWith(prunedMine(pruneBelow)),
     rangeAfter: (n, a) => rangeOf(n, a),
     rangeAt: (n) => rangeOf(n, -1),
     actionValue: (n, a, rank) => {

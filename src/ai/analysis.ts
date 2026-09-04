@@ -50,7 +50,7 @@ export const catOf = (c: Card): Cat => (isUp(c) ? "UP" : "DOWN");
  *    1 = 每一命的折算比例固定（总量越大越谨慎，因为剩下的局数越多、越值得靠每局的小优势磨）。
  * 实测（见 CHANGELOG）：机器人每局有真实优势，所以较强的谨慎在各种命数下都更能赢。
  */
-export const PARAMS = { matchEdge: 0.9, edgeScaling: 1 };
+export const PARAMS = { matchEdge: 0.9, edgeScaling: 1, solveEdge: 0.9 };
 const REF_T = 24;
 const rho = (T: number) => Math.pow(Math.pow((1 - PARAMS.matchEdge) / PARAMS.matchEdge, 2), Math.pow(T / REF_T, PARAMS.edgeScaling));
 
@@ -458,4 +458,27 @@ export function u(delta: number, LMe: number, T: number): number {
 /** 当前局面下 1 命大约值多少效用，用来把以命为单位的参数换算成效用。 */
 export function unitUtility(LMe: number, T: number): number {
   return Math.max(1e-6, (matchWinProb(LMe + 1, T) - matchWinProb(LMe - 1, T)) / 2);
+}
+
+/**
+ * 同一条曲线，但风险态度由调用方给：`edge` 就是 `matchEdge` 的位置。
+ *
+ * 为什么要分家：求解器改成严格零和之后（见 solver.ts 顶部），开司的效用就是我方效用取负。
+ * `matchEdge = 0.9` 意味着「我自认为九成能赢下整场」，取负之后开司就成了自知只有一成胜算的
+ * 绝对劣势方 —— 他的效用曲线是凸的、极度爱好波动，最优策略往「每手全下」退化。
+ * 所以求解用 `PARAMS.solveEdge`（这条），展示 / 选牌 / 参数换算仍用 `PARAMS.matchEdge`。
+ * 两者默认相等（0.9），真正的取值由 Stage B 扫参决定。
+ */
+function matchWinProbEdge(L: number, T: number, edge: number): number {
+  if (L <= 0) return 0;
+  if (L >= T) return 1;
+  // 与 rho(T) 逐字同形：edge = PARAMS.matchEdge 时结果与 matchWinProb 逐位相同。
+  const r = Math.pow(Math.pow((1 - edge) / edge, 2), Math.pow(T / REF_T, PARAMS.edgeScaling));
+  if (!(Math.abs(r - 1) > 1e-12)) return L / T; // edge = 0.5：曲线退化成线性（风险中性）
+  return (1 - Math.pow(r, L / T)) / (1 - r);
+}
+
+/** `u` 的可调风险态度版本：命数变化 delta 带来的效用变化，曲率由 `edge` 决定。 */
+export function uWithEdge(delta: number, LMe: number, T: number, edge: number = PARAMS.solveEdge): number {
+  return matchWinProbEdge(LMe + delta, T, edge) - matchWinProbEdge(LMe, T, edge);
 }

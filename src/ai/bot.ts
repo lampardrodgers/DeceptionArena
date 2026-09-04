@@ -22,10 +22,12 @@ import {
   type Analysis,
   type BotView,
   AI,
+  PARAMS,
   RANKS,
   analyze,
   cmpRank,
   perceivedRange,
+  uWithEdge,
   unitUtility,
   unknownPool,
   u,
@@ -192,11 +194,20 @@ function solveInput(view: BotView, A: Analysis, val: (d: number) => number): Sol
     M: view.maxStake,
     meFirst: view.firstMover === AI,
     LOpp,
-    val,
-    // 开司有自己的凹效用（他也怕输光），不是「我的效用取负」——细节见 solver.ts 顶部注释。
-    valOpp: (d: number) => u(-d, LOpp, LMe + LOpp),
+    // 求解器现在是严格零和（开司效用 = −我方效用），风险态度由求解专用的 `PARAMS.solveEdge` 给：
+    // 把 `makeVal` 里的本局效用项换成 solveEdge 版本，留牌的下一局增益仍沿用 matchEdge
+    //（Stage C 会把它一并改成按点数分档的范围估值，那时 `val` 的第一个参数才真正用起来）。
+    val: solveVal(val, LMe, LMe + LOpp),
+    edge: PARAMS.solveEdge,
     actions: view.actions
   };
+}
+
+/** 把「本局命数变化 → 效用」的曲率从 matchEdge 换成 solveEdge；两者相等时是逐位的恒等变换。 */
+function solveVal(val: (d: number) => number, LMe: number, T: number): (rank: number, d: number) => number {
+  const edge = PARAMS.solveEdge;
+  if (edge === PARAMS.matchEdge) return (_rank, d) => val(d);
+  return (_rank, d) => val(d) - u(d, LMe, T) + uWithEdge(d, LMe, T, edge);
 }
 
 /**
@@ -244,7 +255,7 @@ function stratText(sol: Solved, n: number, rank: number, M: number, max = 3): st
   const st = sol.strategyAt(n, rank);
   const items = acts
     .map((a, i) => ({ a, p: st[i] }))
-    .filter((x) => x.p >= 0.02)
+    .filter((x) => x.p >= SOLVER_PARAMS.displayPrune)
     .sort((x, y) => y.p - x.p)
     .slice(0, max)
     .map((x) => `${actLabel(x.a, M)} ${pct(x.p)}`);
@@ -254,11 +265,11 @@ function stratText(sol: Solved, n: number, rank: number, M: number, max = 3): st
 /**
  * 从平均策略里抽一个动作。
  *
- * 先剔掉概率低于 `SOLVER_PARAMS.prune` 的噪声动作再归一化，然后**按概率从大到小**排序后抽样：
+ * 先剔掉概率低于 `SOLVER_PARAMS.executionPrune` 的噪声动作再归一化，然后**按概率从大到小**排序后抽样：
  * 这样 `rng = () => 0` 就等于「取最可能的动作」，测试和复盘都能拿到确定性的结果。
  */
 function pickAction(idx: number[], strat: number[], rng: Rng): { pick: number; probs: Map<number, number> } {
-  let pool = idx.map((i) => ({ i, p: strat[i] })).filter((x) => x.p >= SOLVER_PARAMS.prune);
+  let pool = idx.map((i) => ({ i, p: strat[i] })).filter((x) => x.p >= SOLVER_PARAMS.executionPrune);
   if (pool.length === 0) pool = idx.map((i) => ({ i, p: strat[i] }));
   const total = pool.reduce((a, x) => a + x.p, 0);
   if (total > 0) for (const x of pool) x.p /= total;
@@ -294,7 +305,8 @@ export function botSelect(view: BotView, rng: Rng = Math.random): BotDecision {
   // 两张候选各求解一次：留牌的下一局价值会改变终局估值，进而改变整条范围的打法，
   // 所以不能「解一次再补一项」。`FutureCache` 在两次之间共享，重算的只是 CFR 迭代本身。
   const cache: FutureCache = new Map();
-  const valNow = (d: number) => u(d, LMe, T);
+  // 与求解用的 `val` 同一条曲线（solveEdge），这样「合计 − 本局 = 留牌增益」才是同一把尺子。
+  const valNow = (_rank: number, d: number) => uWithEdge(d, LMe, T, PARAMS.solveEdge);
   const cands = hand.map((card, i) => {
     const keep = hand[1 - i];
     const sol = solveRound(`sel${i}`, view, A, makeVal(view, A, keep, cache));
