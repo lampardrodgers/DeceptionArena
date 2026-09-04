@@ -49,6 +49,7 @@ import {
   sizeBucketOf,
   sizeProb
 } from "./opponentModel.js";
+import { catOfRank } from "./analysis.js";
 
 /** 点数只有 13 种；求解器内部一律用 0..12 的下标，点数 = 下标 + 2。 */
 const N = 13;
@@ -98,6 +99,8 @@ export interface SolveInput {
   meFirst: boolean;
   /** 开司的命数（影响他对加注额的敏感度）。 */
   LOpp: number;
+  /** 开司自己的指示灯是不是 UP1+DOWN1：是的话行为模型会混入 MIX 联合统计。 */
+  oppMix?: boolean;
   /**
    * 终局估值：我方打出点数 `rank`（2..14）、本局我的命数变化 `delta` 时**我方**的效用
    * （已含留在手里那张牌的下一局价值 —— 它会随打出的点数而变，所以要按 rank 分档）。
@@ -368,6 +371,7 @@ function buildTree(inp: SolveInput): Tree {
 
 function fillModelStrategy(nodes: Node[], strat: Float64Array, inp: SolveInput): void {
   const { model, q, M, LOpp } = inp;
+  const mix = inp.oppMix === true;
   for (const nd of nodes) {
     if (nd.kind !== 1) continue;
     const A = nd.nA;
@@ -375,6 +379,7 @@ function fillModelStrategy(nodes: Node[], strat: Float64Array, inp: SolveInput):
     const nR = A - first;
     for (let i = 0; i < N; i += 1) {
       const qq = q[i + 2] ?? 0.5;
+      const cat = catOfRank(i + 2);
       const base = nd.off + i * A;
       // 各加注额的相对权重来自额度模型（他拿这种牌力时习惯加多大）。
       let wSum = 0;
@@ -389,13 +394,13 @@ function fillModelStrategy(nodes: Node[], strat: Float64Array, inp: SolveInput):
         wSum = 1;
       }
       if (nd.facing) {
-        const pf = foldProb(model, qq, nd.sMe, nd.sOpp, LOpp);
-        const rr = nR > 0 ? (1 - pf) * reraiseProb(model, qq) : 0;
+        const pf = foldProb(model, qq, nd.sMe, nd.sOpp, LOpp, M, cat, mix);
+        const rr = nR > 0 ? (1 - pf) * reraiseProb(model, qq, M, nd.sMe, nd.sOpp) : 0;
         strat[base] = Math.max(0, 1 - pf - rr); // call
         strat[base + 1] = pf; // fold
         for (let r = 0; r < nR; r += 1) strat[base + first + r] *= rr / wSum;
       } else {
-        const pr = nR > 0 && nd.sMe < M && nd.sOpp < M ? aggressionProb(model, nd.aggCtx, qq) : 0;
+        const pr = nR > 0 && nd.sMe < M && nd.sOpp < M ? aggressionProb(model, nd.aggCtx, qq, cat, mix) : 0;
         strat[base] = 1 - pr; // check
         for (let r = 0; r < nR; r += 1) strat[base + first + r] *= pr / wSum;
       }

@@ -50,8 +50,22 @@ export {
   unknownPool
 } from "./analysis.js";
 export type { Analysis, BotView, Cat, Ctx } from "./analysis.js";
-export { MODEL_PARAMS, aggCtxOf, aggressionProb, bin5Of, foldProb, learnOpponent, opponentConfidence, rate, reraiseProb, sizeBucketOf, sizeProb } from "./opponentModel.js";
-export type { AggCtx, Beta, Bin, Bin5, OppModel, OppStats, SizeBucket } from "./opponentModel.js";
+export {
+  MODEL_PARAMS,
+  aggCtxOf,
+  aggressionProb,
+  betaN,
+  bin5Of,
+  contextConfidence,
+  foldProb,
+  learnOpponent,
+  opponentConfidence,
+  rate,
+  reraiseProb,
+  sizeBucketOf,
+  sizeProb
+} from "./opponentModel.js";
+export type { AggCtx, Beta, Bin, Bin5, BySize, ConfSpot, OppModel, OppStats, SizeBucket } from "./opponentModel.js";
 export { SOLVER_PARAMS, solve } from "./solver.js";
 export type { SolveInput, Solved, SolvedAction } from "./solver.js";
 

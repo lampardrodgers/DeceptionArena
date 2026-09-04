@@ -393,6 +393,8 @@ export function analyze(view: BotView): Analysis {
   const posterior = played.slice();
   const st: Record<Side, number> = { player: 1, ai: 1 };
   const M = view.maxStake;
+  // 他自己的指示灯是 UP1+DOWN1 时，「打哪一类牌 + 怎么下注」是一套联合打法，模型可以合起来读。
+  const oppMix = ctxOf(view.lights.player) === "MIX";
   let heRaised = false;
   view.actions.forEach((a, idx) => {
     const op = other(a.side);
@@ -406,13 +408,13 @@ export function analyze(view: BotView): Analysis {
         if (!posterior[c]) continue;
         let lik = 1;
         if (facing) {
-          const pf = foldProb(model, q[c], st[op], st[a.side], view.lives.player);
-          const rr = canRaise ? reraiseProb(model, q[c]) : 0;
+          const pf = foldProb(model, q[c], st[op], st[a.side], view.lives.player, M, catOfRank(c), oppMix);
+          const rr = canRaise ? reraiseProb(model, q[c], M, st[op], st[a.side]) : 0;
           if (a.type === "fold") lik = pf;
           else if (a.type === "raise") lik = (1 - pf) * rr;
           else lik = (1 - pf) * (1 - rr);
         } else if (canRaise) {
-          const pr = aggressionProb(model, aggCtx, q[c]);
+          const pr = aggressionProb(model, aggCtx, q[c], catOfRank(c), oppMix);
           lik = a.type === "raise" ? pr : 1 - pr;
         }
         if (bucket !== null) lik *= sizeProb(model, q[c], bucket);
