@@ -212,9 +212,20 @@ function solveInput(view: BotView, A: Analysis, val: (d: number) => number): Sol
     // 把 `makeVal` 里的本局效用项换成 solveEdge 版本，留牌的下一局增益仍沿用 matchEdge
     //（Stage C 会把它一并改成按点数分档的范围估值，那时 `val` 的第一个参数才真正用起来）。
     val: solveVal(val, LMe, LMe + LOpp),
+    valOpp: oppVal(LOpp, LMe + LOpp),
     edge: PARAMS.solveEdge,
     actions: view.actions
   };
+}
+
+/**
+ * 开司复制体自己的效用曲线（一般和求解）：`PARAMS.oppEdge > 0` 时按他的命数与该风险态度取凹曲线，
+ * 0 则回到严格零和（返回 undefined）。
+ */
+function oppVal(LOpp: number, T: number): ((dOpp: number) => number) | undefined {
+  const edge = PARAMS.oppEdge;
+  if (!(edge > 0)) return undefined;
+  return (dOpp) => uWithEdge(dOpp, LOpp, T, edge);
 }
 
 /** 把「本局命数变化 → 效用」的曲率从 matchEdge 换成 solveEdge；两者相等时是逐位的恒等变换。 */

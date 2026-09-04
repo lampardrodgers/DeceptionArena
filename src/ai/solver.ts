@@ -108,6 +108,14 @@ export interface SolveInput {
    */
   val: (rank: number, delta: number) => number;
   /**
+   * 可选：开司**自己**的效用曲线，参数是他本局的命数变化 `deltaOpp`（= −我方 delta）。
+   * 不给就是严格零和（他的效用 = −val）。给了就是一般和：他按自己的风险态度估值 ——
+   * 实测（v0.1.12 的 H2H 回归）真实对手 / 旧版机器人都是「各自厌恶风险」的，
+   * 把他建模成「自知劣势、爱好波动」的零和复制体会让我方面对加注时过度弃牌。
+   * `exploitability()` 在一般和下仍可算（各自对固定对手的最佳回应增益），但不再是可利用度。
+   */
+  valOpp?: (deltaOpp: number) => number;
+  /**
    * 组装 `val` 时用的风险态度（`PARAMS.solveEdge`）。求解器自己不算效用，这项纯粹是透传，
    * 方便调用方 / 展示层知道这次解是在哪条曲线下算出来的。
    */
@@ -462,6 +470,11 @@ export function solve(inp: SolveInput): Solved {
   const tW = new Float64Array(NB * N);
   const tD = new Float64Array(NB * N);
   const tL = new Float64Array(NB * N);
+  // 一般和时开司自己的终局值，只随节点变（他的效用只看自己的命数变化）：我赢 / 平 / 我输。
+  const oW = new Float64Array(NB);
+  const oD = new Float64Array(NB);
+  const oL = new Float64Array(NB);
+  const generalSum = typeof inp.valOpp === "function";
   const combo = new Float64Array(N);
   const tmp = new Float64Array(N);
   const gW = new Float64Array(N);
@@ -509,6 +522,11 @@ export function solve(inp: SolveInput): Solved {
           D[b + i] = valFn(i + 2, 0);
           L[b + i] = valFn(i + 2, -nd.stake);
         }
+        if (generalSum) {
+          oW[n] = inp.valOpp!(-nd.stake);
+          oD[n] = inp.valOpp!(0);
+          oL[n] = inp.valOpp!(nd.stake);
+        }
       } else {
         const d = nd.term === 1 ? -nd.stake : nd.stake;
         for (let i = 0; i < N; i += 1) {
@@ -516,6 +534,12 @@ export function solve(inp: SolveInput): Solved {
           W[b + i] = v;
           D[b + i] = v;
           L[b + i] = v;
+        }
+        if (generalSum) {
+          const v = inp.valOpp!(-d);
+          oW[n] = v;
+          oD[n] = v;
+          oL[n] = v;
         }
       }
     }
@@ -530,11 +554,21 @@ export function solve(inp: SolveInput): Solved {
    */
   function termOpp(n: number, reach: Float64Array, out: Float64Array): void {
     const b = n * N;
-    for (let i = 0; i < N; i += 1) {
-      const r = reach[b + i];
-      gW[i] = r * tW[b + i];
-      gD[i] = r * tD[b + i];
-      gL[i] = r * tL[b + i];
+    if (generalSum) {
+      // 一般和：他的效用只随结局变，不随我方点数变，对 reach 做前缀和即可（符号也不再取负）。
+      for (let i = 0; i < N; i += 1) {
+        const r = reach[b + i];
+        gW[i] = r * oW[n];
+        gD[i] = r * oD[n];
+        gL[i] = r * oL[n];
+      }
+    } else {
+      for (let i = 0; i < N; i += 1) {
+        const r = reach[b + i];
+        gW[i] = r * tW[b + i];
+        gD[i] = r * tD[b + i];
+        gL[i] = r * tL[b + i];
+      }
     }
     let accW = 0;
     for (let i = N - 1; i >= 0; i -= 1) {
@@ -557,7 +591,7 @@ export function solve(inp: SolveInput): Solved {
         win -= gW[N - 1]; // A 打不过 2
         lose += gL[N - 1];
       }
-      out[b + c] = -(win + gD[c] + lose);
+      out[b + c] = generalSum ? win + gD[c] + lose : -(win + gD[c] + lose);
     }
   }
 

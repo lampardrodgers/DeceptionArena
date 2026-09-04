@@ -50,7 +50,11 @@ export const catOf = (c: Card): Cat => (isUp(c) ? "UP" : "DOWN");
  *    1 = 每一命的折算比例固定（总量越大越谨慎，因为剩下的局数越多、越值得靠每局的小优势磨）。
  * 实测（见 CHANGELOG）：机器人每局有真实优势，所以较强的谨慎在各种命数下都更能赢。
  */
-export const PARAMS = { matchEdge: 0.9, edgeScaling: 1, solveEdge: 0.9 };
+/**
+ * oppEdge：求解器里开司复制体的风险态度（他自认为赢下整场的概率）。> 0 时求解器是一般和，
+ * 开司按自己的凹曲线估值；0 表示严格零和（他的效用 = −我方效用）。见 solver.ts 顶部与 CHANGELOG。
+ */
+export const PARAMS = { matchEdge: 0.9, edgeScaling: 1, solveEdge: 0.9, oppEdge: 0.9 };
 const REF_T = 24;
 const rho = (T: number) => Math.pow(Math.pow((1 - PARAMS.matchEdge) / PARAMS.matchEdge, 2), Math.pow(T / REF_T, PARAMS.edgeScaling));
 
