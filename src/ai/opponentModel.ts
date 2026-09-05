@@ -177,9 +177,9 @@ export interface OppStats {
   aggByCat: Record<AggCtx, Record<Cat, Beta>>;
   /** 同上，面对加注时按打出的牌的类别统计弃牌率。 */
   foldByCat: Record<Cat, Beta>;
-  /** 加注额度落在小 / 中 / 大三桶的 Dirichlet 计数。 */
+  /** 可用集合条件下学得的小 / 中 / 大权重；并非无条件原始计数。 */
   raiseSize: Record<Bin5, [number, number, number]>;
-  /** 加注幅度：(加注到 - 当前) / (上限 - 当前) 的平均。 */
+  /** 三个额度桶均可选时，加注幅度的平均；受限动作不作为全局幅度偏好。 */
   raiseFrac: { sum: number; n: number };
   /** 开司的下注决策样本数（已衰减）。 */
   nEff: number;
@@ -239,6 +239,8 @@ interface Acc {
   aggCat: Record<AggCtx, Record<Cat, Beta>>;
   foldCat: Record<Cat, Beta>;
   size: Record<Bin5, [number, number, number]>;
+  /** 剩余空间为 2 或 3 时，只有中/大两桶；单独学习条件比率。 */
+  sizePair: Record<Bin5, [number, number]>;
   raiseFrac: { sum: number; n: number };
   nEff: number;
 }
@@ -264,6 +266,7 @@ function newAcc(): Acc {
     aggCat: { openFirst: zeroCats(), stabAfterBotCheck: zeroCats(), barrel: zeroCats() },
     foldCat: zeroCats(),
     size: { vweak: [0, 0, 0], weak: [0, 0, 0], mid: [0, 0, 0], strong: [0, 0, 0], vstrong: [0, 0, 0] },
+    sizePair: { vweak: [0, 0], weak: [0, 0], mid: [0, 0], strong: [0, 0], vstrong: [0, 0] },
     raiseFrac: { sum: 0, n: 0 },
     nEff: 0
   };
@@ -302,6 +305,7 @@ function scaleAcc(x: Acc, f: number): void {
       x.rerSz[b][bk].b *= f;
     }
     for (let i = 0; i < 3; i += 1) x.size[b][i] *= f;
+    for (let i = 0; i < 2; i += 1) x.sizePair[b][i] *= f;
   }
   for (const ctx of AGG_CTXS) for (const c of CATS) {
     x.aggCat[ctx][c].a *= f;
@@ -355,7 +359,7 @@ function shrinkBins(data: Record<Bin5, Beta>, prior: Record<Bin5, number>, fold 
 }
 
 /** 额度桶的 Dirichlet：同样加先验后向 3 档收缩（粗粒度同样只由数据估计）。 */
-function shrinkSizes(data: Record<Bin5, [number, number, number]>): Record<Bin5, [number, number, number]> {
+function shrinkSizes(data: Record<Bin5, [number, number, number]>, partial: Record<Bin5, [number, number]>): Record<Bin5, [number, number, number]> {
   const coarse: Record<Bin, [number, number, number]> = { weak: [0, 0, 0], mid: [0, 0, 0], strong: [0, 0, 0] };
   for (const b of BINS5) {
     const g = COARSE[b];
@@ -371,7 +375,12 @@ function shrinkSizes(data: Record<Bin5, [number, number, number]>): Record<Bin5,
     const c = [0, 1, 2].map((i) => (cTotal > 0 ? coarse[g][i] / cTotal : pr[i] / prTotal));
     const n = data[b][0] + data[b][1] + data[b][2] + prTotal;
     const p = [0, 1, 2].map((i) => (data[b][i] + pr[i] + k * c[i]) / (n + k));
-    out[b] = [p[0] * n, p[1] * n, p[2] * n];
+    const [medium, large] = partial[b];
+    // P(中 | 中或大) 的条件似然独立于 P(小)。受限选择只改变中/大的质量分配。
+    // 三桶样本及其层级先验仍决定小桶总质量；所有中/大样本共同决定条件比率。
+    const pairMass = (p[1] + p[2]) * n;
+    const mediumShare = (p[1] * n + medium) / (pairMass + medium + large);
+    out[b] = [p[0] * n, pairMass * mediumShare, pairMass * (1 - mediumShare)];
   }
   return out;
 }
@@ -467,7 +476,7 @@ function finalize(x: Acc): OppStats {
     reraiseBySize: shrinkCells(x.rerSz, rerBins),
     aggByCat,
     foldByCat,
-    raiseSize: shrinkSizes(x.size),
+    raiseSize: shrinkSizes(x.size, x.sizePair),
     raiseFrac: { sum: x.raiseFrac.sum + 0.8, n: x.raiseFrac.n + 2 },
     nEff: x.nEff
   };
@@ -489,13 +498,14 @@ export function chooseProb(m: OppStats, x: number, k: number, ctx: Ctx): number 
 }
 
 /**
- * 把 MIX 联合统计混进 logit：w = n / (n + catBlend)，n 是该类别格的真实样本数。
+ * MIX 类别仅作为后备：其权重随细分牌力的真实样本量增加而下降。
  * 没有样本时 w = 0，完全等价于不传 cat —— 所以这条路径对旧行为是无损的。
  */
-function blendCat(l: number, cell: Beta | null | undefined): number {
+function blendCat(l: number, cell: Beta | null | undefined, fine: Beta): number {
   if (!cell) return l;
   const n = betaN(cell);
-  const w = n / (n + MODEL_PARAMS.catBlend);
+  const k = MODEL_PARAMS.catBlend;
+  const w = n / (n + k) * k / (k + betaN(fine));
   if (!(w > 0)) return l;
   return (1 - w) * l + w * logit(clamp01(rate(cell)));
 }
@@ -552,7 +562,7 @@ export function foldProb(
 /** 双方押注相同时，他在给定情境下主动加注的概率。 */
 export function aggressionProb(m: OppStats, ctx: AggCtx, q: number, cat?: Cat, kaijiIsMix?: boolean): number {
   const bin = bin5Of(q);
-  const base = blendCat(logit(clamp01(rate(m.agg[ctx][bin]))), kaijiIsMix && cat ? m.aggByCat?.[ctx]?.[cat] : null);
+  const base = blendCat(logit(clamp01(rate(m.agg[ctx][bin]))), kaijiIsMix && cat ? m.aggByCat?.[ctx]?.[cat] : null, m.agg[ctx][bin]);
   return sigmoid(base + SLOPE * (q - BIN5_CENTER[bin]));
 }
 
@@ -710,10 +720,19 @@ function addSample(x: Acc, s: BetSample, w: number): void {
     hit(x.agg[s.ctx][s.bin], s.type === "raise", w);
     if (s.mix) hit(x.aggCat[s.ctx][s.cat], s.type === "raise", w);
   }
-  if (s.bucket !== null) x.size[s.bin][s.bucket] += w;
-  if (s.frac !== null) {
-    x.raiseFrac.sum += w * s.frac;
-    x.raiseFrac.n += w;
+  if (s.bucket !== null) {
+    const available = raiseOptions(s.R, s.M).map(o => o.bucket);
+    if (available.length === 3) {
+      x.size[s.bin][s.bucket] += w;
+      if (s.frac !== null) {
+        x.raiseFrac.sum += w * s.frac;
+        x.raiseFrac.n += w;
+      }
+    } else if (available.length === 2 && (s.bucket === 1 || s.bucket === 2)) {
+      // 当前整数三分档下，唯一的二桶集合是 {中, 大}。
+      x.sizePair[s.bin][s.bucket - 1] += w;
+    }
+    // 单桶金额的条件概率恒为 1：不给大小偏好提供证据，前面的再加注统计照常更新。
   }
   // 只有真正需要做决定的动作才算样本（押到上限时的「跟注」是被迫的）。
   if (s.facing || s.canRaise) x.nEff += w;

@@ -14,6 +14,25 @@ npm run bench            # = vitest run src/ai/bench.test.ts --reporter=verbose
 
 ## 输出
 
+### 新旧版本配对检查
+
+可选的 `pairedBench.test.ts` 默认跳过，需要指定一个从 Git 导出的旧版本。示例：
+
+```sh
+baseline_ref=d6c6077
+baseline_dir=$(mktemp -d /tmp/onepoker-baseline.XXXXXX)
+git archive "$baseline_ref" src | tar -x -C "$baseline_dir"
+PAIRED_BASELINE="$baseline_dir/src/ai/bot.ts" PAIRED_REF="$baseline_ref" \
+  npx vitest run src/ai/pairedBench.test.ts --reporter=verbose
+```
+
+默认种子 `11,29`，可用 `PAIRED_SEEDS` 覆盖。对两个固定风格对手分别交换先后手，并覆盖双方命数
+`2:12`、`12:12`、`30:30`，共 24 个配对场景、48 场比赛。发牌与双方动作使用独立随机数流。
+结果写入 `bench/paired-latest.json`，记录各场胜负、明确必胜牌收益和违反双小止损边界的追加动作。
+测试只要求合法完成对局并保持止损边界，不以小样本胜率是否上升作为通过条件。
+
+### 常规测评输出
+
 每跑一次写两个文件：
 
 - `bench/<ISO 时间戳>[-<BENCH_TAG>].json` —— 归档，永不覆盖；

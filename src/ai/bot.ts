@@ -163,7 +163,7 @@ function modelText(m: OppModel): string {
     `持 UP+DOWN 时出 DOWN：我灯 UP2 ${betaText(pd.UP2)} · 混合 ${betaText(pd.MIX)} · DOWN2 ${betaText(pd.DOWN2)}；同类牌先出强牌总体 ${betaText(m.playStrongerSameCat)}（${m.pairSamples} 个样本）。`,
     `同类牌按情境出强牌：两张必赢 ${betaText(m.playStrongerByContext.saveWinner)} · A 对双小避开 2 ${betaText(m.playStrongerByContext.avoidAce)} · 同类争胜 ${betaText(m.playStrongerByContext.contest)}；必胜牌弃牌失误 ${betaText(m.foldCertainWin)}。`,
     `下注倾向（按他自认胜率 <20%/<40%/<60%/<80%/≥80% 分档）：先手开局加注 ${binsText(m.agg.openFirst)}；我过牌后偷注 ${binsText(m.agg.stabAfterBotCheck)}；被跟注后连续开火 ${binsText(m.agg.barrel)}。`,
-    `面对加注弃牌 ${binsText(m.foldToRaise)}；再加注 ${binsText(m.reraise)}；加注额度小/中/大 ${pct(sz[0] / szTotal)}/${pct(sz[1] / szTotal)}/${pct(sz[2] / szTotal)}，平均幅度约 ${pct(m.raiseFrac.sum / m.raiseFrac.n)}。`
+    `面对加注弃牌 ${binsText(m.foldToRaise)}；再加注 ${binsText(m.reraise)}；加注额度小/中/大 ${pct(sz[0] / szTotal)}/${pct(sz[1] / szTotal)}/${pct(sz[2] / szTotal)}，全档位可选时平均幅度约 ${pct(m.raiseFrac.sum / m.raiseFrac.n)}。`
   ].join("\n");
 }
 

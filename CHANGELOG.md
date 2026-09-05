@@ -1,5 +1,13 @@
 # Changelog
 
+## OnePoker-v0.1.16 - 2026-09-05
+
+- Made MIX aggression categories back off as the relevant strength/context cell gains real samples, preserving learned weak-card checks and strong-card raises instead of replacing them with the coarse UP/DOWN average. Added growing-sample, decayed-memory and actual solver-posterior regressions.
+- Conditioned size learning on the buckets available at the observed decision. Single-bucket raises still train aggression/reraising but contribute no size preference; medium/large-only choices update their conditional ratio without changing small-bucket mass. Full-choice samples retain hierarchical smoothing, and the conditional counts decay with the same memory. Global raise-fraction estimates now use only full-choice observations, with matching thinking-panel wording.
+- Added an optional paired release benchmark with separate deal/action RNGs, identical seeds, exchanged first movers, calling-station/tight opponents and 2-vs-12, 12-vs-12 and 30-vs-30 stacks. It records match outcomes, returns on publicly certain winners, and prohibited extra payments by DOWN2 3–7 against UP2; it does not impose an unsupported win-rate improvement claim.
+- Validation: production build and 84 regression tests passed, including all four new learning tests that failed against v0.1.15, the full 252-cell selection scan and the 128-sample mixed execution test. Median selection/betting latency was 384.6/22.7 ms.
+- Paired smoke comparison against v0.1.15 (`d6c6077`, seeds 11/29): 24 matched scenarios, 48 matches total. Both versions won 16/24, with no changed match outcomes and zero prohibited extra payments. Each version encountered only three publicly certain-winning hands, so their identical mean return of 21 lives is too sparse to assess value extraction. This sample establishes neither a win-rate improvement nor equivalence between versions.
+
 ## OnePoker-v0.1.15 - 2026-09-05
 
 - Calibrated fold predictions against the observed price, sunk-stake and strength conditions. Fold counts now carry a matching weighted feature reference through decay, hierarchical shrinkage and fast/slow fusion; query-time pressure applies only relative to that reference. Cold-start pressure remains, while repeated 50% folds at identical conditions converge to approximately 50%. Coarse MIX category evidence backs off as the relevant price cell gains data. This remains a local binned approximation, not a fully fitted logistic model.
