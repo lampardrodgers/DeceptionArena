@@ -44,7 +44,7 @@ export const catOfRank = (r: number): Cat => (r >= 8 ? "UP" : "DOWN");
 export const catOf = (c: Card): Cat => (isUp(c) ? "UP" : "DOWN");
 
 /**
- * 效用曲线（赌徒破产模型）：效用 = 从当前命数出发最终赢下整场的概率。
+ * 效用曲线（借用赌徒破产模型）：用于表达命数风险偏好的启发式，未校准为真实整场胜率。
  *  matchEdge：在 12 对 12 的参考局里，双方命数相等时我们自认为赢下整场的概率。越高越厌恶波动。
  *  edgeScaling：命数总量变化时曲线弯曲程度怎么变。0 = 与总量无关（60 对 60 和 12 对 12 态度一致）；
  *    1 = 每一命的折算比例固定（总量越大越谨慎，因为剩下的局数越多、越值得靠每局的小优势磨）。
@@ -223,6 +223,13 @@ export function catDist(pool: number[], cat: Cat): number[] {
   return normalize(d);
 }
 
+/** 已知旧牌仍属于此牌池时，新牌必须不放回抽取。跨重洗的留牌归属仍用原有近似。 */
+function newCardDist(pool: number[], cat: Cat, held: number, sameShoe: boolean): number[] {
+  if (!sameShoe) return catDist(pool, cat);
+  const remaining = pool.map((n, rank) => catOfRank(rank) === cat ? Math.max(0, n - (rank === held ? 1 : 0)) : 0);
+  return normalize(remaining);
+}
+
 export function ctxOf(l: Lights): Ctx {
   return l.up === 2 ? "UP2" : l.down === 2 ? "DOWN2" : "MIX";
 }
@@ -314,14 +321,14 @@ function heldBelief(view: BotView, m: OppModel): { B: number[] | null; heldCat: 
     } else {
       newCat = otherCat(L, heldCat);
     }
-    const U = catDist(pool, newCat);
     const next = zeros();
     let oldW = 0;
     let newW = 0;
     for (const k of RANKS) {
       const pc = chooseProb(m, X.rank, k, ctx);
-      const wOld = B[k] * U[X.rank];
-      const wNew = B[X.rank] * U[k];
+      const sameShoe = !view.reshuffles.some(round => round <= r.round);
+      const wOld = B[k] * newCardDist(pool, newCat, k, sameShoe)[X.rank];
+      const wNew = B[X.rank] * newCardDist(pool, newCat, X.rank, sameShoe)[k];
       next[k] = pc * (wOld + wNew);
       oldW += pc * wOld;
       newW += pc * wNew;
@@ -389,11 +396,11 @@ export function analyze(view: BotView): Analysis {
     H = catDist(pool, heldCat);
     heldSince = view.round;
   }
-  const U = catDist(pool, newCat);
   const played = zeros();
   const kept = zeros();
   for (const h of RANKS) {
     if (!H[h]) continue;
+    const U = newCardDist(pool, newCat, h, view.reshuffles.length === 0);
     for (const n of RANKS) {
       const w = H[h] * U[n];
       if (!w) continue;
@@ -466,7 +473,7 @@ export function analyze(view: BotView): Analysis {
 
 // ---------- 效用 ----------
 
-/** 持有 L 命（总共 T 命）时最终赢下整场的概率。 */
+/** 持有 L 命（总共 T 命）时的启发式整场效用，取值 0..1；不是实测胜率。 */
 export function matchWinProb(L: number, T: number): number {
   if (L <= 0) return 0;
   if (L >= T) return 1;

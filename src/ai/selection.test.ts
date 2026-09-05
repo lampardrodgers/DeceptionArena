@@ -19,6 +19,7 @@ import {
   policyOf,
   publicView
 } from "./bot.js";
+import { unitUtility } from "./analysis.js";
 
 /** 固定局面：从牌堆里抽指定点数塞进双方手里（与 bot.test.ts 同一套写法）。 */
 function setup(opts: { ai: number[]; player: number[]; firstMover?: Side; lives?: number; seed?: number }): GameState {
@@ -151,11 +152,15 @@ describe("selection: 选牌—下注固定点", () => {
     expect(doomed.length).toBeGreaterThan(0);
     // 基线（v0.1.11 的 softmax 选牌）在这批格子上是 73.9%，现在均值降到十几个百分点。
     expect(mean(doomed)).toBeLessThanOrEqual(0.25);
-    // 残留的例外是「K+2 对 DOWN2」那两格：开司的 DOWN2 对上我方（在他眼里）整条 UP 范围毫无胜算，
-    // 于是无论我打哪张他都弃牌 —— 打那张 2 的代价只剩「摊牌时输掉的那部分」（约 0.8 命），
-    // 和「把 K 留到下一局」的价值（约 0.6 命）非常接近，固定点就真的混起来了。
-    // 这是当前模型诚实的答案，不是没收敛：把固定点迭代从 6 轮加到 24 轮，这两格反而更偏向送掉小牌。
-    expect(over.length).toBeLessThanOrEqual(2);
+    // MIX 有可信的大牌范围，允许有收益支持的诈唬/留牌取舍。
+    // 不把历史上恰好只有两个例外当规则：逐个核对高频小牌的完整后续价值，
+    // 同时保留上面的总体 25% 上限。双小对双大的零加注边界另有全节点测试。
+    for (const c of over) {
+      const view = publicView(setup({ ai: [c.up, c.down], player: OPP_HAND[c.oppCtx], firstMover: c.first }));
+      const pol = policyOf(view, analyze(view));
+      const ev = pol.evPairs.get(pairKey(c.up, c.down))!;
+      expect((ev.evA - ev.evB) / unitUtility(view.lives.ai, view.lives.ai + view.lives.player)).toBeLessThanOrEqual(0.05);
+    }
   }, 300000);
 
   it("(e) 固定点自洽：选牌聚合出的先验就是下注时用的先验", () => {

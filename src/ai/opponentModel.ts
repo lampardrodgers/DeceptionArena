@@ -38,6 +38,15 @@ export type SizeBucket = 0 | 1 | 2;
 
 const BINS5: Bin5[] = ["vweak", "weak", "mid", "strong", "vstrong"];
 const AGG_CTXS: AggCtx[] = ["openFirst", "stabAfterBotCheck", "barrel"];
+/** 同类选牌分情境学习；数值为「打较强牌」的冷启动先验，不是硬规则。 */
+const CHOICE_PRIOR = { saveWinner: 0.1, avoidAce: 0.02, contest: 0.7, saveLoser: 0.1, mixed: 0.5 };
+type ChoiceCtx = keyof typeof CHOICE_PRIOR;
+const CHOICE_CTXS = Object.keys(CHOICE_PRIOR) as ChoiceCtx[];
+function choiceCtx(x: number, k: number, ctx: Ctx): ChoiceCtx {
+  if (ctx === "DOWN2" && catOfRank(x) === "UP") return x === 14 || k === 14 ? "avoidAce" : "saveWinner";
+  if (ctx === "UP2" && catOfRank(x) === "DOWN") return "saveLoser";
+  return ctx === "MIX" ? "mixed" : "contest";
+}
 const CTXS: Ctx[] = ["UP2", "MIX", "DOWN2"];
 const BUCKETS: SizeBucket[] = [0, 1, 2];
 
@@ -148,6 +157,9 @@ export interface OppStats {
   playDownWhenMixed: Record<Ctx, Beta>;
   /** 两张同类牌时先打出较强那张的概率（只统计能确认留牌身份的样本）。 */
   playStrongerSameCat: Beta;
+  playStrongerByContext: Record<ChoiceCtx, Beta>;
+  /** 公开范围下必胜牌的弃牌失误，零弃牌先验，独立于下注价格。 */
+  foldCertainWin: Beta;
   pairSamples: number;
   /** 三种情境下主动加注的概率，按他自认为的胜率分 5 档。 */
   agg: Record<AggCtx, Record<Bin5, Beta>>;
@@ -220,6 +232,8 @@ export function aggCtxOf(isFirstActionOfRound: boolean, heRaisedBefore: boolean)
 interface Acc {
   playDown: Record<Ctx, Beta>;
   playStronger: Beta;
+  choice: Record<ChoiceCtx, Beta>;
+  foldCertain: Beta;
   pairSamples: number;
   agg: Record<AggCtx, Record<Bin5, Beta>>;
   fold: Record<Bin5, Beta>;
@@ -243,6 +257,8 @@ function newAcc(): Acc {
   return {
     playDown: { UP2: zeroBeta(), MIX: zeroBeta(), DOWN2: zeroBeta() },
     playStronger: zeroBeta(),
+    choice: Object.fromEntries(CHOICE_CTXS.map(c => [c, zeroBeta()])) as Record<ChoiceCtx, Beta>,
+    foldCertain: zeroBeta(),
     pairSamples: 0,
     agg: { openFirst: zeroBins(), stabAfterBotCheck: zeroBins(), barrel: zeroBins() },
     fold: zeroBins(),
@@ -266,6 +282,12 @@ function scaleAcc(x: Acc, f: number): void {
   }
   x.playStronger.a *= f;
   x.playStronger.b *= f;
+  for (const c of CHOICE_CTXS) {
+    x.choice[c].a *= f;
+    x.choice[c].b *= f;
+  }
+  x.foldCertain.a *= f;
+  x.foldCertain.b *= f;
   for (const ctx of AGG_CTXS) for (const b of BINS5) {
     x.agg[ctx][b].a *= f;
     x.agg[ctx][b].b *= f;
@@ -419,6 +441,10 @@ function finalize(x: Acc): OppStats {
       DOWN2: withPrior(x.playDown.DOWN2, 0.3, 5)
     },
     playStrongerSameCat: withPrior(x.playStronger, 0.5, 4),
+    playStrongerByContext: Object.fromEntries(CHOICE_CTXS.map(c => [c,
+      withPrior(x.choice[c], c === "mixed" ? rate(withPrior(x.playStronger, 0.5, 4)) : CHOICE_PRIOR[c], 4)
+    ])) as Record<ChoiceCtx, Beta>,
+    foldCertainWin: withPrior(x.foldCertain, 0, 8),
     pairSamples: x.pairSamples,
     agg,
     foldToRaise: foldBins,
@@ -444,7 +470,7 @@ export function chooseProb(m: OppStats, x: number, k: number, ctx: Ctx): number 
     const pd = rate(m.playDownWhenMixed[ctx]);
     return cx === "DOWN" ? pd : 1 - pd;
   }
-  const ps = rate(m.playStrongerSameCat);
+  const ps = rate(m.playStrongerByContext[choiceCtx(x, k, ctx)]);
   return cmpRank(x, k) > 0 ? ps : 1 - ps;
 }
 
@@ -482,6 +508,8 @@ export function foldProb(
   cat?: Cat,
   kaijiIsMix?: boolean
 ): number {
+  // 只有几乎精确的 1 才是必胜；A 对双小存在 2 的风险，不走此分支。
+  if (q >= 1 - 1e-12) return rate(m.foldCertainWin);
   const bin = bin5Of(q);
   const base = blendCat(logit(clamp01(rate(foldCell(m, bin, R, sOpp, M)))), kaijiIsMix && cat ? m.foldByCat?.[cat] : null);
   const l = base + SLOPE * (BIN5_CENTER[bin] - q) + (KAPPA * (R - sOpp)) / Math.max(1, LOpp) - (MU * (sOpp - 1)) / Math.max(1, R);
@@ -563,6 +591,7 @@ export function contextConfidence(m: OppModel, spot: ConfSpot): number {
   const share = spot.bin ? 1 : 0.5;
   let n = 0;
   if (spot.facing) {
+    if (bins.includes("vstrong")) n += share * betaN(m.foldCertainWin);
     const buckets = spot.bucket === null ? BUCKETS : [spot.bucket];
     for (const b of bins) {
       n += share * (betaN(m.foldToRaise[b]) + betaN(m.reraise[b]));
@@ -628,9 +657,12 @@ function actionLogLik(m: OppStats, x: BetSample): number {
 
 function addSample(x: Acc, s: BetSample, w: number): void {
   if (s.facing) {
-    hit(x.fold[s.bin], s.type === "fold", w);
-    if (s.faceBucket !== null) hit(x.foldSz[s.bin][s.faceBucket], s.type === "fold", w);
-    if (s.mix) hit(x.foldCat[s.cat], s.type === "fold", w);
+    if (s.q >= 1 - 1e-12) hit(x.foldCertain, s.type === "fold", w);
+    else {
+      hit(x.fold[s.bin], s.type === "fold", w);
+      if (s.faceBucket !== null) hit(x.foldSz[s.bin][s.faceBucket], s.type === "fold", w);
+      if (s.mix) hit(x.foldCat[s.cat], s.type === "fold", w);
+    }
     if (s.type !== "fold" && s.canRaise) {
       hit(x.rer[s.bin], s.type === "raise", w);
       if (s.faceBucket !== null) hit(x.rerSz[s.bin][s.faceBucket], s.type === "raise", w);
@@ -660,7 +692,7 @@ export function learnOpponent(view: BotView, decay?: number): OppModel {
   const pools = historyPools(view);
   const recentFrom = view.history.length - MODEL_PARAMS.recentRounds;
   // 追踪开司留在手里的那张牌：类别，以及它被留下期间他打出过哪些牌。
-  let held: { cat: Cat; plays: Card[] } | null = null;
+  let held: { cat: Cat; plays: { card: Card; ctx: Ctx; round: number }[] } | null = null;
   let prevRound: number | null = null;
   let lastRound = 0;
 
@@ -684,29 +716,34 @@ export function learnOpponent(view: BotView, decay?: number): OppModel {
     // ---- 选牌偏好 ----
     for (const acc of accs) if (isMix) hit(acc.playDown[ctx], xCat === "DOWN", 1);
     if (!held) {
-      held = { cat: otherCat(L, xCat), plays: [X] };
+      held = { cat: otherCat(L, xCat), plays: [{ card: X, ctx, round: r.round }] };
     } else {
       const newCat = otherCat(L, held.cat);
       if (newCat !== held.cat) {
         if (xCat === held.cat) {
           // 打出的正是留了几局的那张：身份确认，之前每次「宁可打别的也不打它」都是样本。
-          for (const Y of held.plays) {
+          for (const sample of held.plays) {
+            const Y = sample.card;
             if (catOf(Y) !== xCat) continue;
             const cmp = cmpRank(Y.rank, X.rank);
             if (cmp === 0) continue;
-            for (const acc of accs) {
-              hit(acc.playStronger, cmp > 0, 1);
+            for (let k = 0; k < accs.length; k += 1) {
+              const acc = accs[k];
+              // 身份虽到本局才确认，情境和衰减年龄仍属于当初的选牌局。
+              const weight = Math.pow(decays[k], r.round - sample.round);
+              hit(acc.playStronger, cmp > 0, weight);
+              hit(acc.choice[choiceCtx(Y.rank, X.rank, sample.ctx)], cmp > 0, weight);
               acc.pairSamples += 1;
             }
           }
-          held = { cat: newCat, plays: [X] };
+          held = { cat: newCat, plays: [{ card: X, ctx, round: r.round }] };
         } else {
-          held.plays.push(X);
+          held.plays.push({ card: X, ctx, round: r.round });
         }
       } else {
         // 新旧两张同类，分不清留下的是哪张：之前的留牌历史作废，
         // 但本局「打 X 而留另一张同类牌」本身是一次有效的同类取舍。
-        held = { cat: held.cat, plays: [X] };
+        held = { cat: held.cat, plays: [{ card: X, ctx, round: r.round }] };
       }
     }
 
@@ -822,6 +859,10 @@ function fuse(fast: OppStats, slow: OppStats, w: number): OppStats {
   return {
     playDownWhenMixed: pd,
     playStrongerSameCat: fuseBeta(fast.playStrongerSameCat, slow.playStrongerSameCat, w),
+    playStrongerByContext: Object.fromEntries(CHOICE_CTXS.map(c => [c,
+      fuseBeta(fast.playStrongerByContext[c], slow.playStrongerByContext[c], w)
+    ])) as Record<ChoiceCtx, Beta>,
+    foldCertainWin: fuseBeta(fast.foldCertainWin, slow.foldCertainWin, w),
     pairSamples: slow.pairSamples,
     agg,
     foldToRaise: bins((s) => s.foldToRaise),
@@ -861,6 +902,8 @@ function stabilityOf(slowAcc: Acc, fast: OppStats, slow: OppStats): number {
   for (const c of CATS) cell(slowAcc.foldCat[c], fast.foldByCat[c], slow.foldByCat[c]);
   for (const c of CTXS) cell(slowAcc.playDown[c], fast.playDownWhenMixed[c], slow.playDownWhenMixed[c]);
   cell(slowAcc.playStronger, fast.playStrongerSameCat, slow.playStrongerSameCat);
+  for (const c of CHOICE_CTXS) cell(slowAcc.choice[c], fast.playStrongerByContext[c], slow.playStrongerByContext[c]);
+  cell(slowAcc.foldCertain, fast.foldCertainWin, slow.foldCertainWin);
   if (n === 0) return 1;
   return 1 - Math.min(1, Math.max(0, sum / n));
 }

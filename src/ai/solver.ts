@@ -14,7 +14,7 @@
  * 实现上不必真的把树复制两份：给开司带两条到达概率向量（rM / rF）即可 —— 我方的反事实值用
  * rM + rF，自由复制体的反事实值只用我方到达概率，天然与 rM 无关。
  *
- * 效用仍是「赢下整场的概率」（`makeVal` 给的 `val`，已含留牌的下一局价值）。
+ * 效用由调用方提供（生产使用命数风险曲线和留牌的下一局近似价值，未经整场胜率校准）。
  *
  * 迭代方案：regret matching+（遗憾截断在 0）+ 交替更新 + 第 t 轮的即时遗憾乘 t（Linear CFR）
  * + 平均策略按 t² 加权（DCFR 的 γ=2）。后两条是为了在 200 次迭代的预算内收敛：几个加注额
@@ -104,7 +104,7 @@ export interface SolveInput {
   /**
    * 终局估值：我方打出点数 `rank`（2..14）、本局我的命数变化 `delta` 时**我方**的效用
    * （已含留在手里那张牌的下一局价值 —— 它会随打出的点数而变，所以要按 rank 分档）。
-   * 开司的效用严格是 `−val(rank, delta)`，求解器不再接受第二条曲线。
+   * 未传 `valOpp` 时开司效用为 `−val(rank, delta)`；传入则按自己的曲线估值。
    */
   val: (rank: number, delta: number) => number;
   /**
@@ -122,6 +122,8 @@ export interface SolveInput {
   edge?: number;
   /** 本局已发生的动作。真实额度会并入抽象，保证现实这条线上的押注额精确。 */
   actions: BetAction[];
+  /** 我方策略约束；在每次迭代、平均策略和最佳回应中统一生效，不改引擎合法动作。 */
+  allowAction?: (rank: number, action: SolvedAction, sMe: number, sOpp: number) => boolean;
   iters?: number;
 }
 
@@ -445,6 +447,24 @@ export function solve(inp: SolveInput): Solved {
   const { nodes, stratSize, root, cur } = buildTree(inp);
   const NB = nodes.length;
 
+  const allowed = new Uint8Array(stratSize).fill(1);
+  const allowedCount = new Uint8Array(NB * N);
+  for (let n = 0; n < NB; n += 1) allowedCount.fill(nodes[n].nA, n * N, (n + 1) * N);
+  if (inp.allowAction) for (const [nodeIndex, nd] of nodes.entries()) {
+    if (nd.kind !== 0) continue;
+    for (let i = 0; i < N; i += 1) {
+      let count = 0;
+      for (let a = 0; a < nd.nA; a += 1) {
+        const ok = inp.allowAction(i + 2, nd.acts[a], nd.sMe, nd.sOpp);
+        allowed[nd.off + i * nd.nA + a] = ok ? 1 : 0;
+        if (ok) count += 1;
+      }
+      if (!count) throw new Error("策略约束不能排除所有合法动作。");
+      // 只在建表时计数；不在每轮 CFR 中重复检查。
+      allowedCount[nodeIndex * N + i] = count;
+    }
+  }
+
   const modelStrat = new Float64Array(stratSize);
   fillModelStrategy(nodes, modelStrat, inp);
 
@@ -650,7 +670,7 @@ export function solve(inp: SolveInput): Solved {
         const r = regret[base + a];
         curStrat[base + a] = r > 0 ? r / s : 0;
       }
-      else for (let a = 0; a < A; a += 1) curStrat[base + a] = 1 / A;
+      else for (let a = 0; a < A; a += 1) curStrat[base + a] = allowed[base + a] / allowedCount[b + i];
     }
     for (let a = 0; a < A; a += 1) {
       const kb = nd.kids[a] * N;
@@ -688,6 +708,7 @@ export function solve(inp: SolveInput): Solved {
         const v = own[b + i];
         const reach = reachArr[b + i];
         for (let a = 0; a < A; a += 1) {
+          if (!allowed[base + a]) continue;
           const r = regret[base + a] + (own[nd.kids[a] * N + i] - v) * wReg;
           regret[base + a] = r > 0 ? r : 0;
           stratSum[base + a] += weight * reach * curStrat[base + a];
@@ -884,7 +905,7 @@ export function solve(inp: SolveInput): Solved {
         for (let a = 0; a < A; a += 1) {
           const kb = nd.kids[a] * N + i;
           const bv = vBR[kb];
-          if (bv > best) best = bv;
+          if (allowed[base + a] && bv > best) best = bv;
           sum += bv;
           cur += me ? myStrat[base + a] * vCur[kb] : vCur[kb];
         }

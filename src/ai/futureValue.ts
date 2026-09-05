@@ -43,6 +43,7 @@ import {
 } from "./analysis.js";
 import { type OppModel, chooseProb, contextConfidence } from "./opponentModel.js";
 import { type Solved, solve } from "./solver.js";
+import { bettingConstraint } from "./strategyConstraints.js";
 
 /** 留牌未来价值的折扣（下一局未必真按估计打出去，牌池也还会变）。 */
 export const GAMMA = 0.7;
@@ -171,6 +172,7 @@ export function buildFvTable(view: BotView, A: Analysis, iters = FV_ITERS): FvTa
           meFirst,
           LOpp,
           oppMix: b.ctx === "MIX",
+          allowAction: bettingConstraint(myCtx, b.ctx, b.D, (d) => uWithEdge(d, LMe, T, PARAMS.solveEdge)),
           // 下一局的终局值：先按**同一条风险曲线**折成效用，再除以当前命数下「一命」的效用，
           // 换回「确定性等价命数」。为什么不能直接用 `d`（线性、风险中性）：那样下一局的求解器
           // 会为了期望值毫无顾忌地放大方差，一张 A 被记成 +3.0 命、一张 2 被记成 −1.1 命，
