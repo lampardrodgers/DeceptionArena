@@ -1,5 +1,9 @@
 # Changelog
 
+## OnePoker-v0.1.17 - 2026-09-05
+
+- Added installable PWA support with a web manifest, standalone display metadata, and Android/iOS app icons. Bumped the favicon cache version and added OnePoker mobile title/status-bar metadata for a more consistent installed-app experience.
+
 ## OnePoker-v0.1.16 - 2026-09-05
 
 - Made MIX aggression categories back off as the relevant strength/context cell gains real samples, preserving learned weak-card checks and strong-card raises instead of replacing them with the coarse UP/DOWN average. Added growing-sample, decayed-memory and actual solver-posterior regressions.
