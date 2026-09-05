@@ -187,7 +187,7 @@ export interface Solved {
   /** 平均策略的节点条件范围，合并行为模型和自由复制体；不可达时回退开局先验。 */
   opponentRangeAt(n: number): number[];
   /** 对手节点上动作的实际混合概率；不可达/非对手节点返回 undefined。 */
-  opponentActionProb(n: number, type: BetActionType): number | undefined;
+  opponentActionProb(n: number, type: BetActionType, raiseTo?: number): number | undefined;
   /** 平均策略下，在节点 n 拿 rank 打出第 a 个动作的期望效用（已按到达概率归一，可直接和 `val` 比）。 */
   actionValue(n: number, a: number, rank: number): number;
 }
@@ -419,6 +419,9 @@ function fillModelStrategy(nodes: Node[], strat: Float64Array, inp: SolveInput):
     const A = nd.nA;
     const first = nd.facing ? 2 : 1; // 加注动作从这里开始
     const nR = A - first;
+    // 注入真实历史金额后，同桶总质量保持不变，只在桶内均分。
+    const bucketCounts = [0, 0, 0];
+    for (let r = 0; r < nR; r++) for (const b of nd.buckets[first + r]) bucketCounts[b]++;
     for (let i = 0; i < N; i += 1) {
       const qq = q[i + 2] ?? 0.5;
       const cat = catOfRank(i + 2);
@@ -427,7 +430,7 @@ function fillModelStrategy(nodes: Node[], strat: Float64Array, inp: SolveInput):
       let wSum = 0;
       for (let r = 0; r < nR; r += 1) {
         let w = 0;
-        for (const b of nd.buckets[first + r]) w += sizeProb(model, qq, b);
+        for (const b of nd.buckets[first + r]) w += sizeProb(model, qq, b) / bucketCounts[b];
         strat[base + first + r] = w;
         wSum += w;
       }
@@ -1108,11 +1111,11 @@ export function solve(inp: SolveInput): Solved {
         ? (modelReachSnapshot[n * N + i] + freeReachSnapshot[n * N + i]) / oppReach[n] : rootOpp[i];
       return out;
     },
-    opponentActionProb: (n, type) => {
+    opponentActionProb: (n, type, raiseTo) => {
       const nd = nodes[n];
       if (nd.kind !== 1 || !(oppReach[n] > 1e-15)) return undefined;
       let mass = 0;
-      for (let a = 0; a < nd.nA; a += 1) if (nd.acts[a].type === type) {
+      for (let a = 0; a < nd.nA; a += 1) if (nd.acts[a].type === type && (raiseTo === undefined || nd.acts[a].raiseTo === raiseTo)) {
         for (let i = 0; i < N; i += 1) {
           const base = nd.off + i * nd.nA + a;
           mass += modelReachSnapshot[n * N + i] * modelStrat[base] + freeReachSnapshot[n * N + i] * avg[base];

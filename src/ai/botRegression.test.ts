@@ -349,6 +349,7 @@ it("executes a profitable complete value-betting route via botBet/act with produ
       }
       return dp[1];
     };
+    const startState = structuredClone(state);
     let reach = 1, earned = 0, utility = 0;
     const path: number[] = [];
     for (let step = 0; state.phase === "betting" && step < M; step++) {
@@ -380,5 +381,48 @@ it("executes a profitable complete value-betting route via botBet/act with produ
     expect(path.length).toBeGreaterThan(3);
     expect(earned).toBeGreaterThanOrEqual(oracle * 0.95);
     expect(utility).toBeGreaterThanOrEqual(utilityOracle - 0.002);
+
+    // Sample the actual production action distribution (including pruning), not just its modal route.
+    // Integrate the fold/call responder analytically at every step to reduce sampling variance.
+    const rng = seededRng(20260905);
+    const returns: number[] = [], utilities: number[] = [];
+    const routes = new Set<string>();
+    for (let sample = 0; sample < 128; sample++) {
+      const s = structuredClone(startState);
+      let live = 1, profit = 0, u = 0;
+      const route: string[] = [];
+      for (let step = 0; s.phase === "betting" && step < M; step++) {
+        const paid = s.players.player.stake;
+        const action = botBet(publicView(s), rng).bet!;
+        route.push(action.type === "raise" ? String(action.raiseTo) : action.type);
+        if (action.type === "raise") {
+          const f = fold(paid, action.raiseTo!);
+          profit += live * f * paid;
+          u += live * f * value(paid);
+          live *= 1 - f;
+          act(s, "ai", action);
+          act(s, "player", { type: "call" });
+        } else {
+          expect(action.type).toBe("check");
+          act(s, "ai", action);
+          if (s.phase === "betting") act(s, "player", { type: "check" });
+        }
+      }
+      expect(s.phase).not.toBe("betting");
+      profit += live * s.lastResult!.livesMoved;
+      u += live * value(s.lastResult!.livesMoved);
+      returns.push(profit); utilities.push(u); routes.add(route.join("→"));
+    }
+    const interval = (xs: number[]) => {
+      const mean = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const se = Math.sqrt(xs.reduce((a, x) => a + (x - mean) ** 2, 0) / (xs.length - 1) / xs.length);
+      return { mean, lower: mean - 1.98 * se, upper: mean + 1.98 * se };
+    };
+    const livesCI = interval(returns), utilityCI = interval(utilities);
+    console.log(`mixed execution (128 samples, ${routes.size} routes): lives ${JSON.stringify(livesCI)}, utility ${JSON.stringify(utilityCI)}`);
+    expect(routes.size).toBeGreaterThan(1);
+    expect(livesCI.lower).toBeGreaterThanOrEqual(oracle * 0.9);
+    expect(utilityCI.lower).toBeGreaterThanOrEqual(utilityOracle - 0.003);
+
   } finally { spy.mockRestore(); }
-}, 30000);
+}, 120000);

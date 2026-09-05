@@ -446,7 +446,7 @@ export function analyze(view: BotView): Analysis {
           const pr = aggressionProb(model, aggCtx, q[c], catOfRank(c), oppMix);
           lik = a.type === "raise" ? pr : 1 - pr;
         }
-        if (bucket !== null) lik *= sizeProb(model, q[c], bucket);
+        if (bucket !== null) lik *= sizeProb(model, q[c], bucket, st[op], M);
         posterior[c] *= Math.max(lik, 1e-6);
       }
       if (a.type === "raise") heRaised = true;

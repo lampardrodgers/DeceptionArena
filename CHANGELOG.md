@@ -1,5 +1,14 @@
 # Changelog
 
+## OnePoker-v0.1.15 - 2026-09-05
+
+- Calibrated fold predictions against the observed price, sunk-stake and strength conditions. Fold counts now carry a matching weighted feature reference through decay, hierarchical shrinkage and fast/slow fusion; query-time pressure applies only relative to that reference. Cold-start pressure remains, while repeated 50% folds at identical conditions converge to approximately 50%. Coarse MIX category evidence backs off as the relevant price cell gains data. This remains a local binned approximation, not a fully fitted logistic model.
+- Unified opponent raise representatives with the integer size-bucket classifier: from 8 at a cap of 12, the representatives are now 9 / 10 / 12. Empty buckets are excluded from likelihood normalization in both historical scoring and current-hand inference.
+- Preserved total model probability per raise bucket when real history injects another amount in the same bucket. Bucket mass is split among its represented amounts, preventing the tree representation from creating unsupported rank evidence. The solved probability accessor can now select an exact raise amount for verification.
+- Added calibration regressions for repeated observations, sunk stakes, MIX context and decayed memories; integer-bucket coverage through a 60-life cap; and model bucket-mass/posterior invariance under history injection. Extended the production botBet/act value test to sample the full executed mixed strategy, including pruning, while analytically integrating the controlled fold/call responder. Full-match value and post-reshuffle belief approximations remain unchanged.
+- Controlled mixed-execution result (128 samples, seed 20260905): three sampled routes, mean 9.5468 expected lives with approximate 95% interval [9.5441, 9.5494], versus the full-integer reference 9.5651. The interval covers bot action-sampling uncertainty in this fixed responder fixture, not uncertainty about human behavior or match win rates.
+- Validation: production build and 80 regression tests passed, including the 252-cell selection scan; median selection/betting latency was 386.8/22.7 ms. Short match smoke sample (seed 11, 12 lives, 8 games each): random 8/8, calling station 6/8, tight 7/8, old heuristic 8/8. The 29/32 result does not establish a statistically reliable win-rate improvement.
+
 ## OnePoker-v0.1.14 - 2026-09-05
 
 - Removed the remaining 0.543478% selection floor caused by including the initial 50/50 pseudo-sample in the six-round average. Training still uses gentle smoothing to prevent early range collapse, but execution averages only real iterations, then re-aggregates and re-solves the returned range. With a one-life stake cap, exact showdown/held-card utility excludes strictly inferior choices; J+A against DOWN2 with both sides at one life now chooses J with probability 1, including tail RNG values.

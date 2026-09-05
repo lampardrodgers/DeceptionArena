@@ -59,13 +59,7 @@ const BIN5_CENTER: Record<Bin5, number> = { vweak: 0.1, weak: 0.3, mid: 0.5, str
  * 极化型对手（最强 + 最弱都加注）根本表达不出来；细分到 5 档后降到 1。
  */
 const SLOPE = 1;
-/**
- * 加注额占对方命数的比例越大，对方越可能弃牌（logit 斜率）。
- * V2 从 1.5 提到 2.0：先验下「中等牌力面对 12 命全下」原本还有约 23% 的跟注率，
- * 明显高估了普通人；提到 2.0 之后降到约 16%，更接近真人。
- * 注意这条斜率**同时作用在按额度分格的统计之上** —— 格子学到的是「他在这个额度桶里的水平」，
- * KAPPA 负责桶内 / 桶间的价格梯度，没有数据时两者恰好退化成原来的纯先验曲线。
- */
+/** 无数据时的价格先验斜率；有数据后只修正相对于已观察条件的偏移。 */
 const KAPPA = 2;
 /** 对方已押注越多越不愿弃牌。 */
 const MU = 1.2;
@@ -138,6 +132,8 @@ export interface Beta {
    * 供 `contextConfidence` 与 MIX 联合统计的混合权重使用。
    */
   n?: number;
+  /** 弃牌特征的加权总和；与 a+b 使用相同的衰减、先验和收缩权重。 */
+  foldFeatureSum?: number;
 }
 export const rate = (x: Beta) => x.a / (x.a + x.b);
 /** 一格背后的真实样本权重（累加器里的 Beta 没有 n，退回 a + b）。 */
@@ -295,11 +291,13 @@ function scaleAcc(x: Acc, f: number): void {
   for (const b of BINS5) {
     x.fold[b].a *= f;
     x.fold[b].b *= f;
+    if (x.fold[b].foldFeatureSum !== undefined) x.fold[b].foldFeatureSum! *= f;
     x.rer[b].a *= f;
     x.rer[b].b *= f;
     for (const bk of BUCKETS) {
       x.foldSz[b][bk].a *= f;
       x.foldSz[b][bk].b *= f;
+      if (x.foldSz[b][bk].foldFeatureSum !== undefined) x.foldSz[b][bk].foldFeatureSum! *= f;
       x.rerSz[b][bk].a *= f;
       x.rerSz[b][bk].b *= f;
     }
@@ -312,6 +310,7 @@ function scaleAcc(x: Acc, f: number): void {
   for (const c of CATS) {
     x.foldCat[c].a *= f;
     x.foldCat[c].b *= f;
+    if (x.foldCat[c].foldFeatureSum !== undefined) x.foldCat[c].foldFeatureSum! *= f;
   }
   x.raiseFrac.sum *= f;
   x.raiseFrac.n *= f;
@@ -327,12 +326,14 @@ const withPrior = (d: Beta, p: number, n: number): Beta => ({ a: d.a + p * n, b:
  * ——这样「完全没数据」时模型恰好等于先验，而「同组邻档有数据」时空档能借到力。
  * 返回的 Beta 已经把收缩后的比率烘进计数里，下游直接 rate() 即可。
  */
-function shrinkBins(data: Record<Bin5, Beta>, prior: Record<Bin5, number>): Record<Bin5, Beta> {
+function shrinkBins(data: Record<Bin5, Beta>, prior: Record<Bin5, number>, fold = false): Record<Bin5, Beta> {
   const coarseA: Record<Bin, number> = { weak: 0, mid: 0, strong: 0 };
   const coarseN: Record<Bin, number> = { weak: 0, mid: 0, strong: 0 };
+  const coarseFeature: Record<Bin, number> = { weak: 0, mid: 0, strong: 0 };
   for (const b of BINS5) {
     const g = COARSE[b];
     coarseA[g] += data[b].a;
+    coarseFeature[g] += data[b].foldFeatureSum ?? 0;
     coarseN[g] += data[b].a + data[b].b;
   }
   const k = MODEL_PARAMS.shrinkBin;
@@ -344,6 +345,11 @@ function shrinkBins(data: Record<Bin5, Beta>, prior: Record<Bin5, number>): Reco
     const coarse = coarseN[g] > 0 ? coarseA[g] / coarseN[g] : prior[b];
     const r = (a + k * coarse) / (n + k);
     out[b] = { a: r * n, b: (1 - r) * n, n: data[b].a + data[b].b };
+    if (fold) {
+      const priorFeature = -SLOPE * BIN5_CENTER[b];
+      const coarseRef = coarseN[g] > 0 ? coarseFeature[g] / coarseN[g] : priorFeature;
+      out[b].foldFeatureSum = ((data[b].foldFeatureSum ?? 0) + PRIOR_N * priorFeature + k * coarseRef) * n / (n + k);
+    }
   }
   return out;
 }
@@ -386,6 +392,9 @@ function shrinkCells(data: BySize, bins: Record<Bin5, Beta>): BySize {
       const r = (d.a + k * parent) / (nD + k);
       const n = nD + k;
       rec[bucket] = { a: r * n, b: (1 - r) * n, n: nD };
+      if (bins[b].foldFeatureSum !== undefined) {
+        rec[bucket].foldFeatureSum = (d.foldFeatureSum ?? 0) + k * featureMean(bins[b], 0);
+      }
     }
     out[b] = rec;
   }
@@ -429,11 +438,16 @@ function finalize(x: Acc): OppStats {
     for (const c of CATS) rec[c] = catCell(x.aggCat[ctx][c], parent, AGG_CAT_PRIOR[ctx]);
     aggByCat[ctx] = rec;
   }
-  const foldBins = shrinkBins(x.fold, FOLD_PRIOR);
+  const foldBins = shrinkBins(x.fold, FOLD_PRIOR, true);
   const rerBins = shrinkBins(x.rer, RERAISE_PRIOR);
   const foldParent = pooledRate(BINS5.map((b) => x.fold[b]));
   const foldByCat = {} as Record<Cat, Beta>;
-  for (const c of CATS) foldByCat[c] = catCell(x.foldCat[c], foldParent, FOLD_CAT_PRIOR);
+  const foldN = BINS5.reduce((n, b) => n + x.fold[b].a + x.fold[b].b, 0);
+  const foldRef = foldN > 0 ? BINS5.reduce((n, b) => n + (x.fold[b].foldFeatureSum ?? 0), 0) / foldN : -SLOPE * 0.5;
+  for (const c of CATS) {
+    foldByCat[c] = catCell(x.foldCat[c], foldParent, FOLD_CAT_PRIOR);
+    foldByCat[c].foldFeatureSum = (x.foldCat[c].foldFeatureSum ?? 0) + CAT_PRIOR_N * foldRef;
+  }
   return {
     playDownWhenMixed: {
       UP2: withPrior(x.playDown.UP2, 0.6, 5),
@@ -492,11 +506,23 @@ function foldCell(m: OppStats, bin: Bin5, R: number, sOpp: number, M?: number): 
   return m.foldBySize[bin][sizeBucketOf(sOpp, R, M)];
 }
 
+function foldFeature(q: number, R: number, s: number, lives: number): number {
+  return -SLOPE * q + KAPPA * (R - s) / Math.max(1, lives) - MU * (s - 1) / Math.max(1, R);
+}
+function featureMean(cell: Beta, fallback: number): number {
+  return cell.foldFeatureSum === undefined ? fallback : cell.foldFeatureSum / (cell.a + cell.b);
+}
+function hitFold(cell: Beta, s: BetSample, w: number): void {
+  hit(cell, s.type === "fold", w);
+  cell.foldFeatureSum = (cell.foldFeatureSum ?? 0) + w * foldFeature(s.q, s.R, s.s, s.lives);
+}
+
 /**
  * 他面对「押到 R」（他自己已押 sOpp、还剩 LOpp 条命）时弃牌的概率。
  *
  * 传了 M 就按额度桶查分格统计（价格—弃牌曲线）；`cat` + `kaijiIsMix` 则再混入 MIX 联合统计。
- * 两个新参数都可选，不传时行为与 V1 完全一致（只有 KAPPA 从 1.5 提到了 2.0）。
+ * 价格、投入和牌力修正以该格已观察特征的加权均值为基准；先验的基准为档中心、零投入。
+ * 这是分档局部近似，异质条件下不等同于完整的逻辑回归。
  */
 export function foldProb(
   m: OppStats,
@@ -511,9 +537,16 @@ export function foldProb(
   // 只有几乎精确的 1 才是必胜；A 对双小存在 2 的风险，不走此分支。
   if (q >= 1 - 1e-12) return rate(m.foldCertainWin);
   const bin = bin5Of(q);
-  const base = blendCat(logit(clamp01(rate(foldCell(m, bin, R, sOpp, M)))), kaijiIsMix && cat ? m.foldByCat?.[cat] : null);
-  const l = base + SLOPE * (BIN5_CENTER[bin] - q) + (KAPPA * (R - sOpp)) / Math.max(1, LOpp) - (MU * (sOpp - 1)) / Math.max(1, R);
-  return sigmoid(l);
+  const cell = foldCell(m, bin, R, sOpp, M);
+  const feature = foldFeature(q, R, sOpp, LOpp);
+  const local = logit(clamp01(rate(cell))) + feature - featureMean(cell, -SLOPE * BIN5_CENTER[bin]);
+  const category = kaijiIsMix && cat ? m.foldByCat[cat] : undefined;
+  if (!category) return sigmoid(local);
+  // 类别是更粗的后备信息；不能以大量异条件类别样本覆盖已有充分数据的价格格。
+  const k = MODEL_PARAMS.catBlend;
+  const w = betaN(category) / (betaN(category) + k) * k / (k + betaN(cell));
+  const catLogit = logit(clamp01(rate(category))) + feature - featureMean(category, -SLOPE * BIN5_CENTER[bin]);
+  return sigmoid((1 - w) * local + w * catLogit);
 }
 
 /** 双方押注相同时，他在给定情境下主动加注的概率。 */
@@ -534,21 +567,27 @@ export function reraiseProb(m: OppStats, q: number, M?: number, R?: number, sOpp
 }
 
 /** 他拿自认胜率 q 的牌加注时，额度落在某个桶的概率。 */
-export function sizeProb(m: OppStats, q: number, bucket: SizeBucket): number {
+export function sizeProb(m: OppStats, q: number, bucket: SizeBucket, from?: number, M?: number): number {
   const c = m.raiseSize[bin5Of(q)];
-  const total = c[0] + c[1] + c[2];
-  return total > 0 ? c[bucket] / total : 1 / 3;
+  const available = from !== undefined && M !== undefined ? raiseOptions(from, M).map(o => o.bucket) : BUCKETS;
+  if (!available.includes(bucket)) return 0;
+  const total = available.reduce<number>((n, b) => n + c[b], 0);
+  return total > 0 ? c[bucket] / total : 1 / available.length;
 }
 
-/**
- * 他从 from 加注时的三个代表额度：最小、中码、全下。
- * 第 i 项对应第 i 个额度桶（桶的频率就是该额度的权重）；上限很近时会退化成同一个数，
- * 调用方按额度合并权重即可。
- */
+/** 每个非空额度桶选一个合法整数：小桶最小值、中桶中点、大桶最大值。 */
 export function raiseOptions(from: number, M: number): { to: number; bucket: SizeBucket }[] {
-  if (from >= M) return [];
-  const raw = [from + 1, Math.round((from + 1 + M) / 2), M];
-  return raw.map((v, i) => ({ to: Math.min(M, Math.max(from + 1, v)), bucket: i as SizeBucket }));
+  const span = M - from;
+  if (span <= 0) return [];
+  const out: { to: number; bucket: SizeBucket }[] = [];
+  for (const bucket of BUCKETS) {
+    const lo = Math.max(1, Math.ceil(span * bucket / 3));
+    const hi = bucket === 2 ? span : Math.ceil(span * (bucket + 1) / 3) - 1;
+    if (lo > hi) continue;
+    const delta = bucket === 0 ? lo : bucket === 2 ? hi : Math.round((lo + hi) / 2);
+    out.push({ to: from + delta, bucket });
+  }
+  return out;
 }
 
 /** 预计开司从当前押注 from 加注到多少（深层节点用的单一代表额）。 */
@@ -645,13 +684,13 @@ function actionLogLik(m: OppStats, x: BetSample): number {
     if (x.type === "fold") p = pf;
     else if (x.type === "raise") p = (1 - pf) * rr;
     else p = (1 - pf) * (1 - rr);
-    if (x.type === "raise" && x.bucket !== null) p *= sizeProb(m, x.q, x.bucket);
+    if (x.type === "raise" && x.bucket !== null) p *= sizeProb(m, x.q, x.bucket, x.R, x.M);
     return safeLog(p);
   }
   if (!x.canRaise) return 0;
   const pr = aggressionProb(m, x.ctx, x.q, x.cat, x.mix);
   let p = x.type === "raise" ? pr : 1 - pr;
-  if (x.type === "raise" && x.bucket !== null) p *= sizeProb(m, x.q, x.bucket);
+  if (x.type === "raise" && x.bucket !== null) p *= sizeProb(m, x.q, x.bucket, x.R, x.M);
   return safeLog(p);
 }
 
@@ -659,9 +698,9 @@ function addSample(x: Acc, s: BetSample, w: number): void {
   if (s.facing) {
     if (s.q >= 1 - 1e-12) hit(x.foldCertain, s.type === "fold", w);
     else {
-      hit(x.fold[s.bin], s.type === "fold", w);
-      if (s.faceBucket !== null) hit(x.foldSz[s.bin][s.faceBucket], s.type === "fold", w);
-      if (s.mix) hit(x.foldCat[s.cat], s.type === "fold", w);
+      hitFold(x.fold[s.bin], s, w);
+      if (s.faceBucket !== null) hitFold(x.foldSz[s.bin][s.faceBucket], s, w);
+      if (s.mix) hitFold(x.foldCat[s.cat], s, w);
     }
     if (s.type !== "fold" && s.canRaise) {
       hit(x.rer[s.bin], s.type === "raise", w);
@@ -813,7 +852,11 @@ export function learnOpponent(view: BotView, decay?: number): OppModel {
 function fuseBeta(f: Beta, s: Beta, w: number): Beta {
   const r = w * rate(f) + (1 - w) * rate(s);
   const n = s.a + s.b;
-  return { a: r * n, b: (1 - r) * n, n: betaN(s) };
+  const out: Beta = { a: r * n, b: (1 - r) * n, n: betaN(s) };
+  if (f.foldFeatureSum !== undefined && s.foldFeatureSum !== undefined) {
+    out.foldFeatureSum = (w * featureMean(f, 0) + (1 - w) * featureMean(s, 0)) * n;
+  }
+  return out;
 }
 
 function fuse(fast: OppStats, slow: OppStats, w: number): OppStats {
