@@ -43,9 +43,11 @@ import {
   type SizeBucket,
   aggCtxOf,
   aggressionProb,
+  bin5Of,
   foldProb,
   raiseOptions,
   reraiseProb,
+  rate,
   sizeBucketOf,
   sizeProb
 } from "./opponentModel.js";
@@ -81,6 +83,12 @@ export interface SolvedAction {
   raiseTo?: number;
   /** 便于比较 / 展示的键。 */
   key: string;
+}
+
+export interface ActionConstraint {
+  (rank: number, action: SolvedAction, sMe: number, sOpp: number, opponentRange?: ArrayLike<number>): boolean;
+  /** 这些点数的约束要用当前节点的条件范围重新判断，其余只计算一次。 */
+  conditionedRanks?: number[];
 }
 
 export interface SolveInput {
@@ -123,7 +131,7 @@ export interface SolveInput {
   /** 本局已发生的动作。真实额度会并入抽象，保证现实这条线上的押注额精确。 */
   actions: BetAction[];
   /** 我方策略约束；在每次迭代、平均策略和最佳回应中统一生效，不改引擎合法动作。 */
-  allowAction?: (rank: number, action: SolvedAction, sMe: number, sOpp: number) => boolean;
+  allowAction?: ActionConstraint;
   iters?: number;
 }
 
@@ -153,7 +161,7 @@ export interface Solved {
   childOf(n: number, a: number): number;
   /** 节点 n 是谁的决策：0 = 我方，1 = 开司，2 = 终局。 */
   kindOf(n: number): 0 | 1 | 2;
-  /** 节点 n 上我方点数 rank 的平均策略（顺序同 actionsOf）。 */
+  /** 节点 n 上点数 rank 的平均策略（顺序同 actionsOf）；对手节点返回自由复制体，实际混合见 opponentActionProb。 */
   strategyAt(n: number, rank: number): number[];
   /** 我方各点数在根节点的期望效用。 */
   rootValue(rank: number): number;
@@ -176,6 +184,10 @@ export interface Solved {
   rangeAfter(n: number, a: number): number[];
   /** 节点 n 处开司眼中我方的范围（未按动作细分）。 */
   rangeAt(n: number): number[];
+  /** 平均策略的节点条件范围，合并行为模型和自由复制体；不可达时回退开局先验。 */
+  opponentRangeAt(n: number): number[];
+  /** 对手节点上动作的实际混合概率；不可达/非对手节点返回 undefined。 */
+  opponentActionProb(n: number, type: BetActionType): number | undefined;
   /** 平均策略下，在节点 n 拿 rank 打出第 a 个动作的期望效用（已按到达概率归一，可直接和 `val` 比）。 */
   actionValue(n: number, a: number, rank: number): number;
 }
@@ -256,6 +268,23 @@ interface Tree {
 
 function buildTree(inp: SolveInput): Tree {
   const { M, actions } = inp;
+  // 同一牌力档已学到不同额度的支付差异时，补入桶边界前的最大整数。
+  // 例如已押 4、上限 12 时，小注桶最后一个额度是 6，而旧抽象只有 5/9/12。
+  // 冷启动三个格子的先验相同，不增加分支；每层最多增加两个额度。
+  const refinePayments = inp.oppPrior.some((mass, rank) => {
+    if (!(mass > 0) || rank < 2) return false;
+    const cells = inp.model.foldBySize[bin5Of(inp.q[rank] ?? 0.5)];
+    const values = [0, 1, 2].map(b => rate(cells[b as SizeBucket]));
+    return Math.max(...values) - Math.min(...values) > 0.1;
+  });
+  const sizesForMe = (from: number, raises: number): number[] => {
+    const sizes = new Set(mySizes(from, M, raises));
+    if (refinePayments) for (const fraction of [1 / 3, 2 / 3]) {
+      const to = from + Math.ceil((M - from) * fraction) - 1;
+      if (to > from && to <= M) sizes.add(to);
+    }
+    return [...sizes].sort((a, b) => a - b);
+  };
   // 加注次数上限按真实历史抬高：现实已经打到第 k 次加注了，树里还得留得下「我再加一次、
   // 他再加一次」，否则当前信息集会被抽象逼成 call/fold 二选一，深层的再加注威胁全部消失。
   // 但这个抬高只给「沿着现实这条线」的分支：偏离现实的分支仍按分岔点已有的加注数 + 2 封顶，
@@ -301,7 +330,7 @@ function buildTree(inp: SolveInput): Tree {
     // 加注：以对方的押注为基准（引擎规定 raiseTo > 对方押注，上限 M）。
     const sizes: { to: number; buckets: SizeBucket[] }[] = [];
     if (theirs < M && raises < maxR) {
-      if (meActs) for (const to of mySizes(theirs, M, raises)) sizes.push({ to, buckets: [] });
+      if (meActs) for (const to of sizesForMe(theirs, raises)) sizes.push({ to, buckets: [] });
       else sizes.push(...oppSizes(theirs, M));
     }
     if (onPath && onPath.type === "raise" && onPath.raiseTo != null && !sizes.some((s) => s.to === onPath.raiseTo)) {
@@ -530,6 +559,32 @@ export function solve(inp: SolveInput): Solved {
   const rootOpp = new Float64Array(N);
   for (let i = 0; i < N; i += 1) rootOpp[i] = rM[rb + i] + rF[rb + i];
 
+  // 只用此节点的到达概率作为安全边界证据，绝不把后验重新注入根部而重复回放历史。
+  // 动态约束属于保守策略近似，不据此宣称无约束 CFR 的收敛保证。
+  const conditionalRanks = inp.allowAction?.conditionedRanks ?? [];
+  const conditionalRange = new Float64Array(15);
+  function updateConditionalMask(n: number): void {
+    const nd = nodes[n];
+    const b = n * N;
+    let mass = 0;
+    for (let i = 0; i < N; i += 1) mass += rM[b + i] + rF[b + i];
+    for (let i = 0; i < N; i += 1) conditionalRange[i + 2] = mass > 1e-15
+      ? (rM[b + i] + rF[b + i]) / mass : rootOpp[i];
+    for (const rank of conditionalRanks) {
+      const base = nd.off + toIdx(rank) * nd.nA;
+      let count = 0;
+      for (let a = 0; a < nd.nA; a += 1) {
+        const ok = inp.allowAction!(rank, nd.acts[a], nd.sMe, nd.sOpp, conditionalRange);
+        allowed[base + a] = ok ? 1 : 0;
+        // 已被禁止的动作不能通过旧遗憾重新进入策略。
+        if (!ok) regret[base + a] = 0;
+        if (ok) count += 1;
+      }
+      if (!count) throw new Error("条件策略约束不能排除所有合法动作。");
+      allowedCount[b + toIdx(rank)] = count;
+    }
+  }
+
   /**
    * 把终局估值写进 W/D/L 三个数组（W = 我赢、D = 平、L = 我输），每个数组 NB × N：
    * 同一个终局节点在不同的「我方打出点数」下值不一样（留牌的下一局价值不同）。
@@ -648,6 +703,7 @@ export function solve(inp: SolveInput): Solved {
     const A = nd.nA;
     const off = nd.off;
     const me = nd.kind === 0;
+    if (me && conditionalRanks.length) updateConditionalMask(n);
     // 我方到达这个节点的总概率。开司的信息集只有在我方到得了的时候才学得到东西
     //（他的反事实值是按我方到达概率加权的），到不了就把策略交还给对手模型 ——
     // 否则他会一直守着早期迭代留下的、我方一旦跟注就不成立的过激打法，
@@ -762,7 +818,7 @@ export function solve(inp: SolveInput): Solved {
   }
 
   /** 用平均策略跑一遍，填出各节点的到达概率与期望值。 */
-  function walkAvg(n: number): void {
+  function walkAvg(n: number, projectConstraints = false): void {
     const nd = nodes[n];
     if (nd.kind === 2) {
       fillTerminal(n, true);
@@ -772,6 +828,20 @@ export function solve(inp: SolveInput): Solved {
     const A = nd.nA;
     const off = nd.off;
     const me = nd.kind === 0;
+    // 跨轮平均可能包含旧范围下允许的动作；按最终平均对手策略的条件范围再投影一次。
+    if (me && projectConstraints && conditionalRanks.length) {
+      updateConditionalMask(n);
+      for (const rank of conditionalRanks) {
+        const base = off + toIdx(rank) * A;
+        let sum = 0;
+        for (let a = 0; a < A; a += 1) {
+          if (!allowed[base + a]) avg[base + a] = 0;
+          sum += avg[base + a];
+        }
+        for (let a = 0; a < A; a += 1) avg[base + a] = sum > 0
+          ? avg[base + a] / sum : allowed[base + a] / allowedCount[b + toIdx(rank)];
+      }
+    }
     for (let a = 0; a < A; a += 1) {
       const kb = nd.kids[a] * N;
       if (me) {
@@ -787,7 +857,7 @@ export function solve(inp: SolveInput): Solved {
           rF[kb + i] = rF[b + i] * avg[off + i * A + a];
         }
       }
-      walkAvg(nd.kids[a]);
+      walkAvg(nd.kids[a], projectConstraints);
     }
     for (let i = 0; i < N; i += 1) vMe[b + i] = 0;
     for (let a = 0; a < A; a += 1) {
@@ -807,11 +877,13 @@ export function solve(inp: SolveInput): Solved {
   }
 
   resetRoot();
-  walkAvg(root);
+  walkAvg(root, true);
   const rootVals = new Float64Array(N);
   rootVals.set(vMe.subarray(rb, rb + N));
   // 平均策略下的到达概率就是「开司眼中我方在各节点的范围」，策略不变时它也不会变。
   const reachSnapshot = new Float64Array(rMe);
+  const modelReachSnapshot = new Float64Array(rM);
+  const freeReachSnapshot = new Float64Array(rF);
   const valueSnapshot = new Float64Array(vMe);
   // 每个节点上开司的到达概率总和：把反事实值换算回「一命值多少」的尺度时要除掉它。
   const oppReach = new Float64Array(NB);
@@ -1030,6 +1102,24 @@ export function solve(inp: SolveInput): Solved {
     exploitabilityOf: (pruneBelow) => exploitWith(prunedMine(pruneBelow)),
     rangeAfter: (n, a) => rangeOf(n, a),
     rangeAt: (n) => rangeOf(n, -1),
+    opponentRangeAt: (n) => {
+      const out = new Array<number>(15).fill(0);
+      for (let i = 0; i < N; i += 1) out[i + 2] = oppReach[n] > 1e-15
+        ? (modelReachSnapshot[n * N + i] + freeReachSnapshot[n * N + i]) / oppReach[n] : rootOpp[i];
+      return out;
+    },
+    opponentActionProb: (n, type) => {
+      const nd = nodes[n];
+      if (nd.kind !== 1 || !(oppReach[n] > 1e-15)) return undefined;
+      let mass = 0;
+      for (let a = 0; a < nd.nA; a += 1) if (nd.acts[a].type === type) {
+        for (let i = 0; i < N; i += 1) {
+          const base = nd.off + i * nd.nA + a;
+          mass += modelReachSnapshot[n * N + i] * modelStrat[base] + freeReachSnapshot[n * N + i] * avg[base];
+        }
+      }
+      return mass / oppReach[n];
+    },
     actionValue: (n, a, rank) => {
       const kid = nodes[n].kids[a];
       const r = oppReach[kid];

@@ -330,12 +330,12 @@ export function pairsOf(ctx: Ctx, theirs: number[]): { a: number; b: number; w: 
 interface PairState {
   ra: number;
   rb: number;
-  /** 平均策略的分子 / 分母（含一份权重为 1 的 0.5 伪计数，见下）。 */
+  /** 只累计实际迭代产生的策略；初始化的 50/50 不参与最终平均。 */
   sum: number;
   wSum: number;
   /** 本轮策略。 */
   sigma: number;
-  /** 到目前为止的平均策略 —— 聚合 `myPrior` 用的是它，不是本轮策略。 */
+  /** 训练时为平滑后的平均策略，执行前恢复为实际迭代平均；用于聚合 `myPrior`。 */
   avg: number;
 }
 
@@ -352,12 +352,12 @@ interface PairState {
  * regret matching+ 更新 σ。返回求解得到的平均策略，不额外给劣势选择注入概率。
  */
 export function selectionPolicy(view: BotView, A: Analysis, fv: FvTable, iters = SELECT_ITERS): SelectionPolicy {
+  iters = Math.max(1, Math.floor(iters));
   const ctx = ctxOf(view.lights.ai);
   const pairs = pairsOf(ctx, A.theirs);
   const st = new Map<number, PairState>();
-  // 伪计数 (0.5, 权重 1)：第一轮的 `myPrior` 就是「两张牌各半」（也就是旧版按指示灯 + 牌池的先验），
-  // 之后每轮往里掺入新的策略，避免第一轮的极端最佳回应直接把范围甩到 97% 打 UP 上。
-  for (const p of pairs) st.set(pairKey(p.a, p.b), { ra: 0, rb: 0, sum: 0.5, wSum: 1, sigma: 0.5, avg: 0.5 });
+  // 50/50 用于训练初始化和平滑，不记入 sum/wSum，不能永久留在实际选牌概率里。
+  for (const p of pairs) st.set(pairKey(p.a, p.b), { ra: 0, rb: 0, sum: 0, wSum: 0, sigma: 0.5, avg: 0.5 });
   const poolFallback = normalize(A.pool.slice());
 
   let myPrior = zeros();
@@ -425,8 +425,20 @@ export function selectionPolicy(view: BotView, A: Analysis, fv: FvTable, iters =
       // 的最佳回应只以 1/91 的权重出现。虚拟对局对的是**平均策略**（`avg`），迭代之间不会来回甩。
       s.sum += t * t * s.sigma;
       s.wSum += t * t;
-      s.avg = s.sum / s.wSum;
+      // 训练时保留一份轻微的 50/50 平滑，避免第一轮纯策略使后续范围过早塌缩。
+      // 它只影响下一轮求解输入；最终执行前必须剥离，不能形成隐含选牌下限。
+      s.avg = (s.sum + 0.5) / (s.wSum + 1);
     }
+  }
+  for (const s of st.values()) s.avg = s.sum / s.wSum;
+  // M=1 没有下注空间，可以精确比较开牌+留牌效用，清除早期探索留下的严格劣势选择。
+  if (view.maxStake === 1) for (const pair of pairs) {
+    const value = (play: number, keep: number) => {
+      const val = makeValByRank(view, () => oneHot(keep), fv);
+      return RANKS.reduce((sum, rank) => sum + A.played[rank] * val(play, cmpRank(play, rank)), 0);
+    };
+    const a = value(pair.a, pair.b), b = value(pair.b, pair.a);
+    if (Math.abs(a - b) > 1e-12) st.get(pairKey(pair.a, pair.b))!.avg = a > b ? 1 : 0;
   }
   // 保留求解得到的混合，不强行为较差选择补足 2%。
   const sigma = new Map<number, number>();
@@ -684,10 +696,6 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
   const sMe = view.stakes.ai;
   const sOpp = view.stakes.player;
   const unit = unitUtility(view.lives.ai, view.lives.ai + view.lives.player);
-  const D = A.posterior;
-  const o = zeros();
-  for (const c of RANKS) o[c] = cmpRank(mine.rank, c);
-  const oc = outcomes(D, o);
   const opening = view.actions.length === 0;
 
   const pol = policyOf(view, A);
@@ -696,6 +704,10 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
   // 仍是按出牌点数聚合的近似：重解会间接影响复制体的回应，完整一致性需扩展为出牌+留牌私有类型。
   const keptGiven = (rank: number) => (rank === mine.rank ? oneHot(keep?.rank ?? null) : pol.keptGiven(rank));
   const sol = solveRound(view, A, pol, keptGiven);
+  const D = sol.opponentRangeAt(sol.cur);
+  const o = zeros();
+  for (const c of RANKS) o[c] = cmpRank(mine.rank, c);
+  const oc = outcomes(D, o);
   // 求解器的动作集来自引擎的状态机，正常情况下和 `legal` 完全一致；
   // 这里再筛一道纯属兜底 —— 机器人绝不能返回非法动作。
   const isLegal = (a: SolvedAction) =>
@@ -708,7 +720,7 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
           : legal.canRaise && a.raiseTo! >= legal.minRaiseTo && a.raiseTo! <= legal.maxRaiseTo;
   const acts = sol.kindOf(sol.cur) === 0 ? sol.actionsOf(sol.cur) : [];
   const allowed = constraintOf(view, A);
-  const idx = acts.map((_, i) => i).filter((i) => isLegal(acts[i]) && allowed(mine.rank, acts[i], sMe, sOpp));
+  const idx = acts.map((_, i) => i).filter((i) => isLegal(acts[i]) && allowed(mine.rank, acts[i], sMe, sOpp, D));
   const strat = idx.length > 0 ? sol.strategyAt(sol.cur, mine.rank) : [];
   const chosen = idx.length > 0 ? pickAction(idx, strat, rng) : null;
   const bet: BetInput = chosen
@@ -721,22 +733,8 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
         ? { type: "fold" }
         : { type: "call" };
 
-  /** 开司在我打出某个动作之后的弃牌率（按他本局的出牌后验加权，供展示）。 */
-  const foldRate = (kid: number): number | undefined => {
-    if (sol.kindOf(kid) !== 1) return undefined;
-    const a2 = sol.actionsOf(kid);
-    const fi = a2.findIndex((x) => x.type === "fold");
-    if (fi < 0) return undefined;
-    let s = 0;
-    let tot = 0;
-    for (const c of RANKS) {
-      const w = D[c];
-      if (!w) continue;
-      tot += w;
-      s += w * sol.strategyAt(kid, c)[fi];
-    }
-    return tot > 0 ? s / tot : undefined;
-  };
+  // 到达当前节点后模型/自由复制体的比例可能改变，展示必须与收益计算使用同一份混合。
+  const foldRate = (kid: number): number | undefined => sol.opponentActionProb(kid, "fold");
 
   const actionText = idx
     .map((i) => ({ i, ev: sol.actionValue(sol.cur, i, mine.rank) }))
@@ -762,7 +760,7 @@ export function botBet(view: BotView, rng: Rng = Math.random): BotDecision {
     `【局面】我打出 ${cardLabel(mine)}（我灯 ${lightsText(view.lights.ai)}），开司灯 ${lightsText(view.lights.player)}，先手 ${view.firstMover === AI ? "我" : "开司"}；押注 我 ${sMe} / 开司 ${sOpp}，上限 ${M}；本局动作：${actsText}。${keep ? `手里还留着 ${cardLabel(keep)}，它对下一局的增益已按各种结局计入。` : ""}`,
     poolText(view, A),
     handText(view, A),
-    `【开司出牌分布】按其本局下注修正后：${distText(D)}。我方胜 ${pct(oc.win)} / 平 ${pct(oc.draw)} / 负 ${pct(oc.lose)}。`,
+    `【开司出牌分布】求解器当前节点的条件范围（模型与自由策略混合）：${distText(D)}。我方胜 ${pct(oc.win)} / 平 ${pct(oc.draw)} / 负 ${pct(oc.lose)}。`,
     ...(ctxOf(view.lights.ai) === "DOWN2" && ctxOf(view.lights.player) === "UP2"
       ? ["【保守边界】双小对双大，3～7 只过牌或弃牌；2 仅在公开的 A 范围和本局风险收益都支持时追加。"] : []),
     decisionText(view, A, pol, sol),

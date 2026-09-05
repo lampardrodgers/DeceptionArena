@@ -13,15 +13,24 @@ export function bettingConstraint(
   utility: (delta: number) => number
 ): NonNullable<SolveInput["allowAction"]> {
   const total = oppPrior.reduce((s, p) => s + p, 0);
-  const ace = total > 0 ? (oppPrior[14] ?? 0) / total : 0;
-  const showdown = (stake: number) => ace * utility(stake) + (1 - ace) * utility(-stake);
-  return (rank, action, sMe, sOpp) => {
+  const priorAce = total > 0 ? (oppPrior[14] ?? 0) / total : 0;
+  const values = new Map<number, number>();
+  const u = (d: number) => {
+    if (!values.has(d)) values.set(d, utility(d));
+    return values.get(d)!;
+  };
+  const allow: NonNullable<SolveInput["allowAction"]> = (rank, action, sMe, sOpp, range) => {
     if (mine !== "DOWN2" || opponent !== "UP2" || rank >= 8) return true;
     if (action.type === "check" || action.type === "fold") return true;
     if (rank !== 2) return false;
-    if (action.type === "call") return showdown(sOpp) > utility(-sMe) + 1e-12;
+    const ace = range ? range[14] : priorAce;
+    const showdown = (stake: number) => ace * u(stake) + (1 - ace) * u(-stake);
+    if (action.type === "call") return showdown(sOpp) > u(-sMe) + 1e-12;
     // 主动进攻必须具有摊牌优势，并优于过牌/弃牌及跟注的保守基准。
-    const passive = sOpp > sMe ? Math.max(utility(-sMe), showdown(sOpp)) : showdown(sMe);
+    const passive = sOpp > sMe ? Math.max(u(-sMe), showdown(sOpp)) : showdown(sMe);
     return ace > 0.5 && showdown(action.raiseTo!) > passive + 1e-12;
   };
+  // 仅 2 需要随节点证据更新；3～7 的静态硬边界不随对手策略松动。
+  allow.conditionedRanks = mine === "DOWN2" && opponent === "UP2" ? [2] : [];
+  return allow;
 }
